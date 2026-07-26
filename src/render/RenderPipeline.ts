@@ -52,8 +52,8 @@ const _matA = new THREE.Matrix4();
 
 interface DynamicEntry {
   mesh: THREE.Mesh;
+  /** World matrix as of the last frame this mesh wrote velocity. */
   prev: THREE.Matrix4;
-  moved: boolean;
 }
 
 export class RenderPipeline implements RenderSystem {
@@ -134,6 +134,13 @@ export class RenderPipeline implements RenderSystem {
 
   private dynamics: DynamicEntry[] = [];
   private dynamicRefresh = 0;
+  /**
+   * FXAA is the only anti-aliasing when TAA is off, but it is a full-resolution
+   * 13-tap pass and a machine already missing frame time cannot pay for it.
+   * Latched off frame-time with hysteresis, and off to begin with so the very
+   * first frame — always the most expensive one — never carries it.
+   */
+  private fxaaOn = false;
 
   // -------------------------------------------------------------------------
   // Lifecycle
@@ -195,6 +202,15 @@ export class RenderPipeline implements RenderSystem {
   /** Current internal render scale, 0.6..1. Useful for HUD diagnostics. */
   get renderScale(): number {
     return this.adaptiveScale;
+  }
+
+  /**
+   * The scene pass's depth attachment, in internal buffer resolution. The FX
+   * system reads this to soften particle intersections against world geometry;
+   * it is null until the targets are allocated and again after dispose.
+   */
+  getSceneDepthTexture(): THREE.Texture | null {
+    return this.sceneRT?.depthTexture ?? null;
   }
 
   // -------------------------------------------------------------------------
@@ -359,10 +375,12 @@ export class RenderPipeline implements RenderSystem {
         tDepth: { value: null },
         uResolution: { value: new THREE.Vector2() },
         uShutter: { value: 0.5 },
-        uMaxRadius: { value: 0.045 },
+        uMaxRadius: { value: 0.032 },
         uFrame: { value: 0 },
       },
-      { MB_TAPS: 4 },
+      // 8 iterations = 16 taps either side of the pixel. Fewer than this and
+      // the jittered tap pattern shows as a comb along fast-moving silhouettes.
+      { MB_TAPS: heavy ? 8 : 4 },
     );
 
     this.mDof = this.makeMaterial(
@@ -415,6 +433,7 @@ export class RenderPipeline implements RenderSystem {
       uVignette: { value: 0.34 },
       uGrain: { value: 0.022 },
       uSharpen: { value: 0.32 },
+      uFxaa: { value: 0 },
     });
 
   }
@@ -620,7 +639,7 @@ export class RenderPipeline implements RenderSystem {
       if (!isDynamic) return;
       o.getWorldPosition(_v3b);
       found.push({
-        entry: { mesh, prev: new THREE.Matrix4().copy(mesh.matrixWorld), moved: false },
+        entry: { mesh, prev: new THREE.Matrix4().copy(mesh.matrixWorld) },
         d: _v3b.distanceToSquared(camPos),
       });
     });
@@ -798,6 +817,18 @@ export class RenderPipeline implements RenderSystem {
       u.tDiffuse.value = tonemapTarget.texture;
       (u.uResolution.value as THREE.Vector2).set(w, h);
       u.uTime.value = ctx.time.elapsed;
+      // MSAA is unavailable through render targets and the renderer is created
+      // with antialias:false, so with TAA off FXAA is the only thing standing
+      // between the player and crawling geometry edges — when it is affordable.
+      const frameMs = ctx.time.rawDt;
+      if (frameMs > 0.045) this.fxaaOn = false;
+      else if (frameMs > 0 && frameMs < 0.020) this.fxaaOn = true;
+      u.uFxaa.value = !taaOn && this.fxaaOn ? 1 : 0;
+      // Unsharp mask amplifies whatever the upscale reconstructed. Backing it
+      // off with the internal resolution keeps a 0.7-scale frame from turning
+      // every chamfer into a bright dash.
+      u.uSharpen.value = 0.32 * (0.42 + 0.58 * this.adaptiveScale);
+      u.uAberration.value = 0.0038 * (0.45 + 0.55 * this.adaptiveScale);
       this.blit(this.mFinal, null);
     }
 

@@ -1,0 +1,57 @@
+[
+  {
+    "name": "hero",
+    "pos": [
+      0,
+      1.65,
+      8
+    ],
+    "yaw": 0,
+    "pitch": -0.03,
+    "desc": "Establishing shot down the main street"
+  },
+  {
+    "name": "weapon",
+    "pos": [
+      2,
+      1.65,
+      4
+    ],
+    "yaw": 0.6,
+    "pitch": -0.05,
+    "desc": "Viewmodel readability, hip fire"
+  },
+  {
+    "name": "interior",
+    "pos": [
+      -8,
+      1.65,
+      -6
+    ],
+    "yaw": 2.2,
+    "pitch": 0,
+    "desc": "Indoor lighting, bounce, shadow contact"
+  },
+  {
+    "name": "skyline",
+    "pos": [
+      4,
+      1.65,
+      -18
+    ],
+    "yaw": 3.1,
+    "pitch": 0.12,
+    "desc": "Sky, atmosphere, distant fog"
+  },
+  {
+    "name": "detail",
+    "pos": [
+      -2,
+      1.4,
+      2
+    ],
+    "yaw": 1.1,
+    "pitch": -0.35,
+    "desc": "Close surface detail: normals, roughness, AO"
+  }
+]

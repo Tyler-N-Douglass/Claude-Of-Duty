@@ -16,7 +16,7 @@
  */
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -101,7 +101,35 @@ async function main() {
     process.exit(1);
   }
 
+  // Playwright's bundled-browser revision can drift from what this image has
+  // installed. Fall back to any chromium build present under the browsers path
+  // rather than failing the whole capture on a version number.
+  const findChromium = () => {
+    const roots = [process.env.PLAYWRIGHT_BROWSERS_PATH, '/opt/pw-browsers', `${process.env.HOME}/.cache/ms-playwright`];
+    for (const root of roots) {
+      if (!root || !existsSync(root)) continue;
+      for (const dir of readdirSync(root)) {
+        if (!/^chromium(_headless_shell)?-/.test(dir)) continue;
+        const exe = resolve(root, dir, 'chrome-linux', 'chrome');
+        if (existsSync(exe)) return exe;
+        const shell = resolve(root, dir, 'chrome-linux', 'headless_shell');
+        if (existsSync(shell)) return shell;
+      }
+    }
+    return undefined;
+  };
+
+  let executablePath;
+  try {
+    chromium.executablePath();
+    if (!existsSync(chromium.executablePath())) executablePath = findChromium();
+  } catch {
+    executablePath = findChromium();
+  }
+  if (executablePath) console.log(`[qa] using chromium at ${executablePath}`);
+
   const browser = await chromium.launch({
+    executablePath,
     args: [
       '--use-gl=angle',
       '--use-angle=swiftshader',

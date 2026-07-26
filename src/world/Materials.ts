@@ -72,7 +72,9 @@ interface LookDefaults {
 const DEFAULTS: Record<SurfaceLook, LookDefaults> = {
   concrete_wall: { repeat: 1, normalScale: 1.0, aoIntensity: 1.0, envMapIntensity: 1.0, minSize: 512 },
   concrete_floor: { repeat: 1, normalScale: 0.9, aoIntensity: 1.0, envMapIntensity: 1.0, minSize: 512 },
-  asphalt: { repeat: 1, normalScale: 1.0, aoIntensity: 1.0, envMapIntensity: 1.0, minSize: 512 },
+  // Asphalt takes a reduced env weight: at full strength the sky's specular
+  // lobe dominates a 0.1-albedo horizontal surface and the street renders navy.
+  asphalt: { repeat: 1, normalScale: 0.85, aoIntensity: 1.0, envMapIntensity: 0.55, minSize: 512 },
   brick: { repeat: 1, normalScale: 1.1, aoIntensity: 1.15, envMapIntensity: 0.9, minSize: 512 },
   plaster_painted: { repeat: 1, normalScale: 0.8, aoIntensity: 0.9, envMapIntensity: 1.0, minSize: 512 },
   rusted_metal: { repeat: 1, normalScale: 1.0, aoIntensity: 1.0, envMapIntensity: 1.2, minSize: 512 },

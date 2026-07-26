@@ -41,6 +41,11 @@ export function detectPreset(renderer: { getContext(): WebGLRenderingContext | W
     const ext = gl.getExtension('WEBGL_debug_renderer_info');
     const gpu = ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : '';
     const s = gpu.toLowerCase();
+    // Software rasterisers (SwiftShader in headless CI, llvmpipe on a bare
+    // Linux box) are one to two orders of magnitude slower than any real GPU.
+    // Treating them as low-end is the difference between a capture that
+    // completes and one that times out mid-frame.
+    if (/swiftshader|llvmpipe|softpipe|software|basic render/.test(s)) return 'low';
     const mobile = /adreno|mali|apple gpu|powervr/.test(s);
     if (mobile) return 'low';
     if (/rtx\s*(40|50)|rx\s*7[89]|m[123]\s*(max|ultra)/.test(s)) return 'ultra';

@@ -72,7 +72,7 @@ interface Tuning {
 const TUNING: Record<SurfaceLook, Tuning> = {
   concrete_wall: { normal: 1.5, relief: 0.014, ao: 1.0, cavityRough: 0.10 },
   concrete_floor: { normal: 1.3, relief: 0.012, ao: 0.95, cavityRough: 0.12 },
-  asphalt: { normal: 2.1, relief: 0.018, ao: 1.15, cavityRough: 0.08 },
+  asphalt: { normal: 1.15, relief: 0.007, ao: 0.9, cavityRough: 0.08 },
   brick: { normal: 2.4, relief: 0.024, ao: 1.25, cavityRough: 0.10 },
   plaster_painted: { normal: 1.0, relief: 0.009, ao: 0.85, cavityRough: 0.10 },
   rusted_metal: { normal: 1.7, relief: 0.012, ao: 1.0, cavityRough: 0.06 },
@@ -276,21 +276,28 @@ vec4 surf( vec2 uv ) {
   float bind = fbm( uv * 60.0, vec2( 60.0 ), 5, 0.5 ) * 0.5 + 0.5;
   float crack = smoothstep( 0.78, 0.96, ridged( warp( uv * 6.0, vec2( 6.0 ), 0.60, 3 ), vec2( 6.0 ), 5 ) );
   float hole = smoothstep( 0.82, 1.0, fbm( uv * 4.0 + vec2( 21.0 ), vec2( 4.0 ), 4, 0.55 ) * 0.5 + 0.5 );
-  float patch = smoothstep( 0.60, 0.72, fbm( uv * 3.0 + vec2( 45.0 ), vec2( 3.0 ), 3, 0.5 ) * 0.5 + 0.5 );
-  float h = 0.55 + bind * 0.10 + stone * 0.16 + grit * 0.05 - crack * 0.34 - hole * 0.24;
-  h = mix( h, 0.52 + bind * 0.05, patch );                          // tar repair is smoother
-  float wet = smoothstep( 0.55, 0.86, fbm( uv * 3.0 + vec2( 63.0 ), vec2( 3.0 ), 4, 0.5 ) * 0.5 + 0.5 );
-  return vec4( sat( h ), stone * ( 1.0 - patch ), sat( crack + hole ), wet * ( 1.0 - patch * 0.5 ) );
+  float tarPatch = smoothstep( 0.60, 0.72, fbm( uv * 3.0 + vec2( 45.0 ), vec2( 3.0 ), 3, 0.5 ) * 0.5 + 0.5 );
+  // Height range is deliberately shallow. A road is flat: the whole relief of
+  // real worn asphalt is a couple of millimetres of exposed aggregate plus the
+  // odd centimetre-deep crack. Driving the full 0..1 height range through it
+  // gave a surface that read as cooled lava rather than tarmac.
+  float h = 0.55 + bind * 0.05 + stone * 0.07 + grit * 0.025 - crack * 0.14 - hole * 0.09;
+  h = mix( h, 0.53 + bind * 0.025, tarPatch );                         // tar repair is smoother
+  float wet = smoothstep( 0.70, 0.93, fbm( uv * 3.0 + vec2( 63.0 ), vec2( 3.0 ), 4, 0.5 ) * 0.5 + 0.5 );
+  return vec4( sat( h ), stone * ( 1.0 - tarPatch ), sat( crack + hole ), wet * ( 1.0 - tarPatch * 0.5 ) );
 }
 void shade( vec2 uv, vec4 s, out vec3 alb, out float rgh, out float mtl, out float opa ) {
   float g = fbm( uv * 30.0, vec2( 30.0 ), 3, 0.5 ) * 0.5 + 0.5;
-  vec3 base = vec3( 0.052, 0.051, 0.053 ) * ( 0.8 + 0.5 * g );
-  base = mix( base, vec3( 0.155, 0.150, 0.142 ) * ( 0.7 + 0.6 * g ), s.y * 0.85 );  // exposed aggregate
-  base = mix( base, vec3( 0.115, 0.112, 0.108 ), sat( s.z ) * 0.6 );                // dusty fracture
-  rgh = 0.78 - 0.10 * s.y + 0.08 * sat( s.z );
-  // standing water: darkens albedo hard and drops roughness to near-mirror
-  base *= 1.0 - 0.55 * s.w;
-  rgh = mix( rgh, 0.075, s.w );
+  // Worn city asphalt measures 0.07-0.12 reflectance, not the 0.04 of a fresh
+  // pour. At 0.05 the road reads as a hole in the world once it is in shadow.
+  vec3 base = vec3( 0.118, 0.114, 0.112 ) * ( 0.88 + 0.28 * g );
+  base = mix( base, vec3( 0.205, 0.197, 0.184 ) * ( 0.78 + 0.42 * g ), s.y * 0.8 );   // exposed aggregate
+  base = mix( base, vec3( 0.140, 0.136, 0.130 ), sat( s.z ) * 0.6 );                  // dusty fracture
+  rgh = 0.80 - 0.10 * s.y + 0.08 * sat( s.z );
+  // Damp patches, not standing water: a mild darkening and a partial gloss.
+  // Full mirror roughness turned a fifth of the street into black glass.
+  base *= 1.0 - 0.22 * s.w;
+  rgh = mix( rgh, 0.34, s.w );
   alb = base; mtl = 0.0; opa = 1.0;
 }
 
@@ -353,12 +360,17 @@ vec4 surf( vec2 uv ) {
   float trowel = fbm( warp( uv * 4.0, vec2( 4.0 ), 0.85, 3 ), vec2( 4.0 ), 5, 0.55 ) * 0.5 + 0.5;
   float orange = fbm( uv * 260.0, vec2( 260.0 ), 3, 0.5 ) * 0.5 + 0.5;   // roller stipple
   float hair = smoothstep( 0.88, 0.995, ridged( warp( uv * 14.0, vec2( 14.0 ), 0.35, 3 ), vec2( 14.0 ), 5 ) );
-  // paint peel: worley islands whose edges lift before they let go
-  vec3 pe = worley( warp( uv * 9.0, vec2( 9.0 ), 0.55, 3 ), vec2( 9.0 ) );
-  float bias = fbm( uv * 3.0 + vec2( 55.0 ), vec2( 3.0 ), 4, 0.5 ) * 0.5 + 0.5;
-  float peelT = mix( 0.62, 0.16, smoothstep( 0.35, 0.8, bias ) );
-  float peel = 1.0 - smoothstep( peelT, peelT + 0.10, pe.x );
-  float lip = ( 1.0 - smoothstep( 0.0, 0.055, abs( pe.x - peelT - 0.05 ) ) ) * step( 0.05, peel );
+  // Paint peel: worley islands whose edges lift before they let go. Paint only
+  // fails where water has got behind it, so the flake field is gated by a damp
+  // mask — rising damp at the base of the wall plus a few patches higher up.
+  // Ungated, worley F1 sits around 0.35 and a threshold anywhere near that
+  // strips half the facade, which reads as camouflage rather than decay.
+  vec3 pe = worley( warp( uv * 17.0, vec2( 17.0 ), 0.55, 3 ), vec2( 17.0 ) );
+  float bias = fbm( uv * 2.0 + vec2( 55.0 ), vec2( 2.0 ), 4, 0.5 ) * 0.5 + 0.5;
+  float damp = sat( smoothstep( 0.42, 0.04, uv.y ) * 0.85 + smoothstep( 0.60, 0.88, bias ) * 0.75 );
+  float peelT = mix( 0.015, 0.235, damp );
+  float peel = ( 1.0 - smoothstep( peelT, peelT + 0.05, pe.x ) ) * step( 0.02, damp );
+  float lip = ( 1.0 - smoothstep( 0.0, 0.03, abs( pe.x - peelT - 0.025 ) ) ) * step( 0.05, peel );
   vec3 nails = worley( uv * 6.0 + vec2( 3.3, 7.1 ), vec2( 6.0 ) );
   float nail = ( 1.0 - smoothstep( 0.01, 0.045, nails.x ) ) * step( 0.88, nails.z );
 

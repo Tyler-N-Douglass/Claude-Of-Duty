@@ -6,6 +6,7 @@
  *
  * `render` must be last because it is the RenderSystem and presents the frame.
  */
+import * as THREE from 'three';
 import { Engine } from './core/Engine';
 import { Input } from './core/Input';
 import { Entities } from './core/Entities';
@@ -56,7 +57,10 @@ async function boot(): Promise<void> {
   engine.start();
 
   // Expose for the automated visual-QA harness and for debugging.
-  (window as unknown as { GAME: unknown }).GAME = { engine, ctx: engine.ctx, input, quality };
+  (window as unknown as { GAME: unknown; THREE: unknown }).GAME = {
+    engine, ctx: engine.ctx, input, quality, THREE,
+  };
+  (window as unknown as { THREE: unknown }).THREE = THREE;
   document.dispatchEvent(new CustomEvent('game-ready'));
 }
 

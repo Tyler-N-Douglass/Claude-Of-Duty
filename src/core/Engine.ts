@@ -172,7 +172,12 @@ export class Engine {
     this.rafId = requestAnimationFrame(this.tick);
     if (!this.running) return;
 
-    const rawDt = (ts - this.lastTs) / 1000;
+    // rAF hands back the timestamp of the frame it belongs to, which can predate
+    // the performance.now() captured in start() when init ran long (procedural
+    // texture bakes, the nav bake). That yields a large negative first delta;
+    // unclamped it runs every spring in the game backwards and they never
+    // recover. Deltas are clamped to a sane forward window, always.
+    const rawDt = Math.max(0, (ts - this.lastTs) / 1000);
     this.lastTs = ts;
     const dt = Math.min(rawDt, 0.1);
 

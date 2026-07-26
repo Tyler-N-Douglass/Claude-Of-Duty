@@ -136,7 +136,12 @@ export class SkySystem implements System {
   readonly groundColor = new THREE.Color();
   readonly sunColor = new THREE.Color();
   /** Ambient/IBL scale so the visible dome can be bright without washing PBR. */
-  environmentIntensity = 0.55;
+  /**
+   * IBL weight. The sun runs at 5.0 and a street canyon bounces far more than a
+   * hemisphere light alone provides; below ~0.8 every shadowed facade and the
+   * whole road surface crush to black.
+   */
+  environmentIntensity = 0.92;
 
   private ctx: GameContext | null = null;
   private timeOfDay = DEFAULT_TIME_OF_DAY;

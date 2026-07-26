@@ -60,6 +60,14 @@ export class LightingSystem implements System {
 
   private ctx: GameContext | null = null;
   private hemi: THREE.HemisphereLight | null = null;
+  /**
+   * Fake single-bounce fill. There is no GI here, and without it a street in a
+   * building's shadow is lit only by a blue sky and renders as navy. Real
+   * shadowed asphalt between sunlit sandstone facades picks up a warm bounce
+   * roughly a stop and a half under the key. Shadowless, so it costs one extra
+   * light term and nothing else.
+   */
+  private bounce: THREE.DirectionalLight | null = null;
   private readonly locals: LocalLightEntry[] = [];
   private readonly splits: number[] = [];
   private csmInstalled = false;
@@ -70,6 +78,13 @@ export class LightingSystem implements System {
   private viewRigChecked = false;
   private viewSun: THREE.DirectionalLight | null = null;
   private viewFill: THREE.HemisphereLight | null = null;
+  /**
+   * Viewmodel lights the weapon system brought with it. This system does not
+   * own their positions or their ratios — that rig is authored around the gun —
+   * but it does own how much light the player is standing in, so it scales
+   * them all by the same sun-exposure factor the built-in rig uses.
+   */
+  private readonly borrowedViewLights: { light: THREE.Light; base: number }[] = [];
   private viewSunExposure = 1;
   private viewSunTarget = 1;
   private viewSunProbeCountdown = 0;
@@ -122,13 +137,20 @@ export class LightingSystem implements System {
     // deliberately restrained — it exists to keep shadow interiors from going
     // to a flat neutral.
     // Sky fill, pulled off full saturation so shadows read as cool, not navy.
-    const skyFill = new THREE.Color(0xa3bdf0);
+    const skyFill = new THREE.Color(0xcdd4de);
     const groundFill = sky ? new THREE.Color().copy(sky.groundColor) : new THREE.Color(0x6b5a44);
     const gm = Math.max(groundFill.r, groundFill.g, groundFill.b, 1e-3);
     if (gm > 1) groundFill.multiplyScalar(1 / gm);
-    this.hemi = new THREE.HemisphereLight(skyFill, groundFill, 0.42);
+    this.hemi = new THREE.HemisphereLight(skyFill, groundFill, 0.55);
     this.hemi.position.set(0, 60, 0);
     ctx.scene.add(this.hemi);
+
+    const bounce = new THREE.DirectionalLight(0xffd6a6, this.sunIntensity * 0.20);
+    bounce.name = 'sun-bounce';
+    bounce.castShadow = false;
+    ctx.scene.add(bounce);
+    ctx.scene.add(bounce.target);
+    this.bounce = bounce;
 
     this.prepare(ctx);
   }
@@ -255,6 +277,20 @@ export class LightingSystem implements System {
       light.updateMatrixWorld(true);
     }
 
+    // Bounce comes back from the sunlit side of the street, low and warm: the
+    // sun direction mirrored through the vertical, tilted a little above
+    // horizontal so it reaches the road as well as the facades opposite.
+    const bounce = this.bounce;
+    if (bounce) {
+      _eye.set(-this.sunDirection.x, Math.max(0.42, this.sunDirection.y * 0.5), -this.sunDirection.z)
+        .normalize();
+      bounce.position.copy(_eye).multiplyScalar(30).add(camera.position);
+      bounce.target.position.copy(camera.position);
+      bounce.intensity = this.sunIntensity * 0.20;
+      bounce.updateMatrixWorld(true);
+      bounce.target.updateMatrixWorld(true);
+    }
+
     this.updateLocals(camera);
     this.updateViewmodelRig(ctx);
   }
@@ -270,13 +306,16 @@ export class LightingSystem implements System {
 
     const sky = ctx.system<SkySystem>('sky');
     if (ctx.viewScene.environment === null) ctx.viewScene.environment = ctx.environment;
-    ctx.viewScene.environmentIntensity = sky ? sky.environmentIntensity : 0.55;
+    ctx.viewScene.environmentIntensity = (sky ? sky.environmentIntensity : 0.92) * 0.7;
 
-    let hasLight = false;
     ctx.viewScene.traverse((o) => {
-      if ((o as THREE.Light).isLight === true) hasLight = true;
+      const l = o as THREE.Light;
+      if (l.isLight === true) this.borrowedViewLights.push({ light: l, base: l.intensity });
     });
-    if (hasLight) return;
+    if (this.borrowedViewLights.length > 0) {
+      this.updateViewmodelRig(ctx);
+      return;
+    }
 
     const key = new THREE.DirectionalLight(0xffffff, this.sunIntensity);
     key.name = 'viewmodel-key';
@@ -295,7 +334,7 @@ export class LightingSystem implements System {
 
   private updateViewmodelRig(ctx: GameContext): void {
     const key = this.viewSun;
-    if (!key) return;
+    if (!key && this.borrowedViewLights.length === 0) return;
 
     // The viewmodel casts and receives no world shadows, so instead the key is
     // dimmed when the player themselves is out of the sun. Without this the
@@ -312,6 +351,14 @@ export class LightingSystem implements System {
       this.viewSunTarget = lit;
     }
     this.viewSunExposure += (this.viewSunTarget - this.viewSunExposure) * 0.12;
+
+    if (this.borrowedViewLights.length > 0) {
+      // Never fully dark: a weapon in shade is still lit by the sky and by
+      // bounce off the ground, which is what the 0.34 floor stands in for.
+      const k = 0.34 + 0.66 * this.viewSunExposure;
+      for (const entry of this.borrowedViewLights) entry.light.intensity = entry.base * k;
+    }
+    if (!key) return;
 
     key.position.copy(this.sunDirection).multiplyScalar(24).add(ctx.camera.position);
     key.target.position.copy(ctx.camera.position);

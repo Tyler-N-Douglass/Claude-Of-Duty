@@ -1110,6 +1110,47 @@ uniform float uDistortion;
 uniform float uVignette;
 uniform float uGrain;
 uniform float uSharpen;
+uniform float uFxaa;
+
+/**
+ * Luma FXAA 3.11, trimmed to the console-quality preset. This is the *only*
+ * anti-aliasing when TAA is off — the renderer is created with antialias:false
+ * because the frame is composited through render targets, where MSAA does not
+ * apply. Without it a low preset ships raw, crawling geometry edges.
+ */
+vec3 fxaaFilter( sampler2D tex, vec2 uv, vec2 texel ) {
+  vec3 rgbM = texture2D( tex, uv ).rgb;
+  vec3 rgbNW = texture2D( tex, uv + vec2( -1.0, -1.0 ) * texel ).rgb;
+  vec3 rgbNE = texture2D( tex, uv + vec2(  1.0, -1.0 ) * texel ).rgb;
+  vec3 rgbSW = texture2D( tex, uv + vec2( -1.0,  1.0 ) * texel ).rgb;
+  vec3 rgbSE = texture2D( tex, uv + vec2(  1.0,  1.0 ) * texel ).rgb;
+
+  float lM = lumaOf( rgbM );
+  float lNW = lumaOf( rgbNW );
+  float lNE = lumaOf( rgbNE );
+  float lSW = lumaOf( rgbSW );
+  float lSE = lumaOf( rgbSE );
+  float lMin = min( lM, min( min( lNW, lNE ), min( lSW, lSE ) ) );
+  float lMax = max( lM, max( max( lNW, lNE ), max( lSW, lSE ) ) );
+  // Contrast gate: flat regions are left alone so texture detail survives.
+  if ( lMax - lMin < max( 0.05, lMax * 0.166 ) ) return rgbM;
+
+  vec2 dir = vec2( -( ( lNW + lNE ) - ( lSW + lSE ) ), ( lNW + lSW ) - ( lNE + lSE ) );
+  float reduce = max( ( lNW + lNE + lSW + lSE ) * 0.03125, 0.0078125 );
+  float rcpMin = 1.0 / ( min( abs( dir.x ), abs( dir.y ) ) + reduce );
+  dir = clamp( dir * rcpMin, -8.0, 8.0 ) * texel;
+
+  vec3 rgbA = 0.5 * (
+    texture2D( tex, uv + dir * ( 1.0 / 3.0 - 0.5 ) ).rgb +
+    texture2D( tex, uv + dir * ( 2.0 / 3.0 - 0.5 ) ).rgb
+  );
+  vec3 rgbB = rgbA * 0.5 + 0.25 * (
+    texture2D( tex, uv - dir * 0.5 ).rgb +
+    texture2D( tex, uv + dir * 0.5 ).rgb
+  );
+  float lB = lumaOf( rgbB );
+  return ( lB < lMin || lB > lMax ) ? rgbA : rgbB;
+}
 
 vec3 linearToSrgb( vec3 c ) {
   vec3 lo = c * 12.92;
@@ -1125,12 +1166,17 @@ void main() {
   // Barrel distortion, deliberately at the edge of perceptible.
   vec2 uvD = 0.5 + c * ( 1.0 + uDistortion * r2 );
 
-  // Radial chromatic aberration: zero at centre, grows with r^2.
+  vec3 color = uFxaa > 0.5 ? fxaaFilter( tDiffuse, uvD, texel ) : texture2D( tDiffuse, uvD ).rgb;
+
+  // Radial chromatic aberration: zero at centre, grows with r^2. Applied as a
+  // per-channel *delta* so it composes with the resolved (FXAA'd) colour rather
+  // than throwing that resolve away on two of the three channels.
   float ca = uAberration * r2;
-  vec3 color;
-  color.r = texture2D( tDiffuse, 0.5 + ( uvD - 0.5 ) * ( 1.0 + ca ) ).r;
-  color.g = texture2D( tDiffuse, uvD ).g;
-  color.b = texture2D( tDiffuse, 0.5 + ( uvD - 0.5 ) * ( 1.0 - ca ) ).b;
+  if ( ca > 0.0 ) {
+    vec3 centre = texture2D( tDiffuse, uvD ).rgb;
+    color.r += texture2D( tDiffuse, 0.5 + ( uvD - 0.5 ) * ( 1.0 + ca ) ).r - centre.r;
+    color.b += texture2D( tDiffuse, 0.5 + ( uvD - 0.5 ) * ( 1.0 - ca ) ).b - centre.b;
+  }
 
   // Unsharp mask. Every console title ships one; without it a 1080p frame
   // upscaled from an internal buffer reads soft.
