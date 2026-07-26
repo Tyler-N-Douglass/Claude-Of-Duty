@@ -3,4 +3,6 @@ dist/
 .vite/
 qa/shots/
 *.log
+# Scratch validation scripts agents write while checking their own work.
+.*check.mjs
 .DS_Store
