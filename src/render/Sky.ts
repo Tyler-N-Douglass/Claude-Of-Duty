@@ -3,15 +3,36 @@ import type { FrameTime, GameContext, System } from '../core/Contracts';
 import { SKY_FRAG, SKY_VERT } from './Shaders';
 
 /**
- * Late afternoon. Sun sits at ~19 degrees: long shadows, warm key, cool sky
- * fill, and every vertical surface gets a readable light-to-dark gradient.
+ * Late afternoon. At this hour the rig below puts the sun at ~21 degrees of
+ * elevation and an azimuth of ~154 degrees — which, on this map, is 26 degrees
+ * off the main street's axis. That number is the whole art direction:
+ *
+ *  - The street runs along Z between facades ~12m tall and ~14m apart. A 21
+ *    degree sun throws a 31m shadow; 26 degrees off-axis puts 13.7m of that
+ *    across the street, so the east terrace shades almost the full carriageway
+ *    but leaves a lit strip at the west kerb and floods every alley mouth and
+ *    roofline gap with a long wedge of light. Those wedges, and the shadows of
+ *    balconies and awnings raking down them, are the directional read.
+ *  - It is ahead of the hero camera, so the establishing shot is backlit:
+ *    silhouetted masses, rim light along every parapet, and shafts wherever the
+ *    sun rakes between buildings.
+ *
+ * A sun straight down the street washes out; a sun square across it leaves the
+ * whole canyon in flat shade. 26 degrees is the band where both happen at once.
  */
-export const DEFAULT_TIME_OF_DAY = 17.35;
+export const DEFAULT_TIME_OF_DAY = 16.92;
 
 /** Sun is above the horizon between these hours. */
 const DAY_START = 6;
 const DAY_END = 20;
-const MAX_ELEVATION = 34 * (Math.PI / 180);
+/**
+ * Elevation and azimuth are deliberately decoupled. A single-parameter arc ties
+ * the two together and there is then no way to ask for "low sun raking across
+ * that street" — you get whatever elevation the azimuth you needed implies.
+ */
+const MAX_ELEVATION = 32.6 * (Math.PI / 180);
+const AZIMUTH_START = 68.2 * (Math.PI / 180);
+const AZIMUTH_SWEEP = 110 * (Math.PI / 180);
 
 export interface SkyParams {
   turbidity: number;
@@ -25,15 +46,21 @@ export interface SkyParams {
 // Calibrated against the pipeline's exposure so that after the ACES curve the
 // horizon lands near sRGB 0.87 — bright but still holding detail — and the
 // zenith near 0.5, giving the sky a real value range instead of a white band.
-// Turbidity is pushed past clean air so Mie scatter desaturates the blue into
-// something gradeable rather than a cyan poster.
+//
+// Turbidity is pushed well past clean air and rayleigh pulled back below the
+// textbook 2.0. Both moves do the same job: they trade Rayleigh's saturated
+// blue for Mie's near-white forward scatter. A clean-air sky renders a zenith
+// that is far too chromatic to be a light source — with an IBL driven off this
+// dome, every shadow in the level inherits that blue and the asphalt turns
+// navy. This is a dusty town in summer, and dusty air is what makes the
+// shadows read as grey-blue instead of as ink.
 export const DEFAULT_SKY_PARAMS: SkyParams = {
-  turbidity: 5.4,
-  rayleigh: 1.75,
-  mieCoefficient: 0.0058,
-  mieG: 0.8,
-  intensity: 0.95,
-  cloudCover: 0.54,
+  turbidity: 6.0,
+  rayleigh: 1.14,
+  mieCoefficient: 0.0044,
+  mieG: 0.76,
+  intensity: 0.68,
+  cloudCover: 0.5,
 };
 
 // Preetham fits for sea-level air; identical values drive the GPU dome so the
@@ -48,7 +75,7 @@ const _tmpColor = new THREE.Color();
 export function sunDirectionForTime(hours: number, out = new THREE.Vector3()): THREE.Vector3 {
   const t = THREE.MathUtils.clamp((hours - DAY_START) / (DAY_END - DAY_START), 0.001, 0.999);
   const elevation = MAX_ELEVATION * Math.sin(Math.PI * t);
-  const azimuth = Math.PI * 0.5 + Math.PI * t;
+  const azimuth = AZIMUTH_START + AZIMUTH_SWEEP * t;
   const ce = Math.cos(elevation);
   return out.set(ce * Math.sin(azimuth), Math.sin(elevation), ce * Math.cos(azimuth)).normalize();
 }
@@ -135,13 +162,19 @@ export class SkySystem implements System {
   readonly horizonColor = new THREE.Color();
   readonly groundColor = new THREE.Color();
   readonly sunColor = new THREE.Color();
-  /** Ambient/IBL scale so the visible dome can be bright without washing PBR. */
   /**
-   * IBL weight. The sun runs at 5.0 and a street canyon bounces far more than a
-   * hemisphere light alone provides; below ~0.8 every shadowed facade and the
-   * whole road surface crush to black.
+   * IBL weight, and the single most important number in the frame.
+   *
+   * The dome is a *sky*: bright, and — even at this turbidity — chromatic. Fed
+   * to the PBR ambient at anything near unity it becomes the dominant light on
+   * every surface the sun cannot reach, which is most of a street canyon at 21
+   * degrees. That is what makes engine screenshots look like they were shot
+   * through a blue gel. Real golden-hour sun-to-skylight is 6:1 to 10:1 in
+   * linear terms; with the sun at 7.4 and a warm bounce carrying part of the
+   * fill, the sky's share of that budget is a little over half a unit — a third
+   * of what it was, and the far side of the point where shadows crush.
    */
-  environmentIntensity = 0.92;
+  environmentIntensity = 0.78;
 
   private ctx: GameContext | null = null;
   private timeOfDay = DEFAULT_TIME_OF_DAY;
@@ -175,7 +208,7 @@ export class SkySystem implements System {
         uTime: { value: 0 },
         uCloudCover: { value: this.params.cloudCover },
         uGroundColor: { value: groundLinear },
-        uExposureClamp: { value: 12 },
+        uExposureClamp: { value: 4.0 },
       },
       vertexShader: SKY_VERT,
       fragmentShader: SKY_FRAG,
@@ -210,7 +243,13 @@ export class SkySystem implements System {
 
     this.pmrem = new THREE.PMREMGenerator(ctx.renderer);
 
-    this.fog = new THREE.FogExp2(0x000000, 0.0009);
+    // Deliberately faint. The real aerial perspective is a screen-space pass in
+    // the composite, which integrates height-attenuated density along the view
+    // ray and tints with the sky radiance *in the direction of view* — warm
+    // toward the sun, cool away from it. A uniform FogExp2 cannot do that and
+    // would only flatten the result, so it is left in solely to catch the
+    // transparent surfaces the depth-driven pass never sees.
+    this.fog = new THREE.FogExp2(0x000000, 0.0018);
     this.fog.color.copy(this.horizonColor);
     ctx.scene.fog = this.fog;
 

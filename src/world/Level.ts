@@ -34,12 +34,14 @@ import type { GameContext, FrameTime, System, SurfaceKind } from '../core/Contra
 import { MaterialLibrary, type SurfaceLook } from './Materials';
 import {
   ColliderSet,
+  ContactField,
   GeoBuilder,
   OcclusionBaker,
   Rng,
   archway,
   bevelBox,
   breachedWall,
+  cableGeo,
   copingProfile,
   corniceProfile,
   cylinderGeo,
@@ -50,6 +52,7 @@ import {
   greebleFace,
   kerbProfile,
   matrixOf,
+  paintAerial,
   paintRunoff,
   paintSphere,
   panelledWall,
@@ -59,6 +62,7 @@ import {
   rubbleCone,
   scaleUv,
   shutterGeo,
+  sillProfile,
   spallPatch,
   stairsGeo,
   tintGeometry,
@@ -104,19 +108,30 @@ const SURFACES = {
   paving: { look: 'tile_floor', tiles: 0.5, seed: 4, color: 0xb5aa93 },
   dirt: { look: 'dirt_gravel', tiles: 0.55, seed: 5 },
 
-  plasterCream: { look: 'plaster_painted', tiles: 0.44, seed: 11, color: 0xd6c6a5 },
-  plasterOchre: { look: 'plaster_painted', tiles: 0.44, seed: 12, color: 0xc19a63 },
-  plasterWhite: { look: 'plaster_painted', tiles: 0.44, seed: 13, color: 0xdfd8c6 },
-  plasterBlue: { look: 'plaster_painted', tiles: 0.44, seed: 14, color: 0x9aa9a6 },
-  plasterRose: { look: 'plaster_painted', tiles: 0.44, seed: 15, color: 0xc39281 },
+  // One family, five values. Every tint sits within about 12 degrees of hue of
+  // the next; what separates the buildings is how light they are and how much
+  // the weather has taken off them. A war-torn town does not have a mint
+  // building next to a salmon building — it has one limestone quarry, one
+  // render mix, and sixty years of sun.
+  plasterCream: { look: 'plaster_painted', tiles: 0.44, seed: 11, color: 0xcdc0a8 },
+  plasterOchre: { look: 'plaster_painted', tiles: 0.44, seed: 12, color: 0xb8a381 },
+  plasterWhite: { look: 'plaster_painted', tiles: 0.44, seed: 13, color: 0xd6cebc },
+  plasterBlue: { look: 'plaster_painted', tiles: 0.44, seed: 14, color: 0xa9a898 },
+  plasterRose: { look: 'plaster_painted', tiles: 0.44, seed: 15, color: 0xb59a89 },
 
   // Set back behind every opening on a building you cannot enter. Without it a
   // window is a hole onto the inside of an unlit box, which reads as a bug.
-  interiorDark: { look: 'plaster_painted', tiles: 0.7, seed: 16, color: 0x241f19, roughness: 1.2 },
+  // Not black: a room that has any bounce at all in it is warm and very dark,
+  // and a warm very-dark reads as depth where 0x000000 reads as a hole in the
+  // frame buffer.
+  interiorDark: { look: 'plaster_painted', tiles: 0.7, seed: 16, color: 0x2e2418, roughness: 1.25 },
 
   stone: { look: 'concrete_wall', tiles: 0.42, seed: 21, color: 0xbdb09a },
   concrete: { look: 'concrete_wall', tiles: 0.44, seed: 22, color: 0xa9a49a },
-  brick: { look: 'brick', tiles: 0.5, seed: 23 },
+  // Untinted, the brick map renders as a bright salmon rectangle against pale
+  // limestone render and every spall patch reads as a sticker. A brick that has
+  // been weathering behind a coat of render for fifty years is dark and grey.
+  brick: { look: 'brick', tiles: 0.5, seed: 23, color: 0xac8a70 },
   rubble: { look: 'rubble', tiles: 0.65, seed: 24 },
 
   wood: { look: 'wood_plank', tiles: 1.0, seed: 31, color: 0x9c7c52 },
@@ -284,6 +299,14 @@ export class LevelSystem implements System {
 
   private waterNormal: THREE.Texture | null = null;
 
+  /**
+   * Blast points. Applied to every merged bucket at commit time as a vertex
+   * halo, so soot runs across whatever happens to be near it — road, kerb,
+   * wall base, rubble — instead of stopping at an object boundary the way a
+   * decal does.
+   */
+  private readonly scorch: { p: THREE.Vector3; r: number; s: number }[] = [];
+
   // =========================================================================
   // Lifecycle
   // =========================================================================
@@ -303,6 +326,7 @@ export class LevelSystem implements System {
     this.buildEastBlocks();
     this.buildEndCaps();
     this.buildSquare();
+    this.buildUtilities();
     this.buildScatter();
     this.commit(ctx);
     this.buildLights(ctx);
@@ -466,25 +490,28 @@ export class LevelSystem implements System {
    */
   private buildTerrain(): void {
     // Base ground, wider than the play space so no edge is ever visible.
-    this.add('ground', 'sand', this.groundGrid(-70, -70, 70, 70, -0.06, 2.4, 1, 0.03));
+    this.add('ground', 'sand', this.groundGrid(-70, -70, 70, 70, -0.06, 4.0, 1, 0.03));
     this.collider.addBox('sand', { cx: 0, cy: -0.56, cz: 0, sx: 170, sy: 1, sz: 170 });
     this.floors.push({ x0: -70, z0: -70, x1: 70, z1: 70, y: -0.05 });
 
     // Road: south leg, square, north leg. It runs on through both archways so
     // the vista reads as one continuous street rather than stopping at a wall.
-    this.add('mid', 'road', this.groundGrid(ROAD_W0, -41, ROAD_W1, 41, 0, 1.6, 2, 0.012));
+    // The 0.7m step is not decoration: the baked contact shadow along every
+    // kerb and wall base is a per-vertex term, and a 1.6m grid cannot resolve a
+    // 40cm dark line. Ground triangles are the cheapest in the map.
+    this.add('mid', 'road', this.groundGrid(ROAD_W0, -41, ROAD_W1, 41, 0, 0.85, 2, 0.012));
     this.collider.addBox('concrete', {
       cx: (ROAD_W0 + ROAD_W1) * 0.5, cy: -0.18, cz: 0, sx: ROAD_W1 - ROAD_W0, sy: 0.36, sz: 82,
     });
     this.floors.push({ x0: ROAD_W0, z0: -41, x1: ROAD_W1, z1: 41, y: 0 });
 
     // Square paving on the east side of the road.
-    this.add('mid', 'paving', this.groundGrid(ROAD_W1, -26, 16, -4, 0.02, 1.5, 3, 0.01));
+    this.add('mid', 'paving', this.groundGrid(ROAD_W1, -26, 16, -4, 0.02, 0.85, 3, 0.01));
     this.collider.addBox('concrete', { cx: 11.5, cy: -0.16, cz: -15, sx: 9, sy: 0.36, sz: 22 });
     this.floors.push({ x0: ROAD_W1, z0: -26, x1: 16, z1: -4, y: 0.02 });
 
     // Pavement strip in front of the cafe, with a kerb.
-    this.add('east', 'pavement', this.groundGrid(ROAD_W1, -4, 9.5, 26, 0.15, 1.4, 4, 0.008));
+    this.add('east', 'pavement', this.groundGrid(ROAD_W1, -4, 9.5, 26, 0.15, 0.8, 4, 0.008));
     this.collider.addBox('concrete', { cx: 8.25, cy: 0.0, cz: 11, sx: 2.5, sy: 0.3, sz: 30 });
     this.floors.push({ x0: ROAD_W1, z0: -4, x1: 9.5, z1: 26, y: 0.15 });
 
@@ -509,7 +536,7 @@ export class LevelSystem implements System {
       { x0: -26, z0: -32, x1: -6.9, z1: -26, s: 16 },
       { x0: 16, z0: -34, x1: 44, z1: -30, s: 17 },
     ]) {
-      this.add('ground', 'dirt', this.groundGrid(r.x0, r.z0, r.x1, r.z1, 0.01, 1.6, r.s, 0.02));
+      this.add('ground', 'dirt', this.groundGrid(r.x0, r.z0, r.x1, r.z1, 0.01, 1.0, r.s, 0.02));
       this.collider.addBox('dirt', {
         cx: (r.x0 + r.x1) * 0.5, cy: -0.17, cz: (r.z0 + r.z1) * 0.5,
         sx: r.x1 - r.x0, sy: 0.36, sz: r.z1 - r.z0,
@@ -584,6 +611,8 @@ export class LevelSystem implements System {
     balconyRow?: number;
     windows?: boolean;
     twoLeaf?: boolean;
+    /** Shell holes punched through this elevation, in world run-coordinates. */
+    breaches?: { run: number; y: number; r: number; seed: number }[];
     /** False when the openings lead into a real, built interior. */
     backing?: boolean;
   }): { runs: { run: number; y: number; w: number; h: number; storey: number }[] } {
@@ -595,14 +624,23 @@ export class LevelSystem implements System {
     const win = o.windows === false
       ? { openings: [] as Opening[], runs: [] }
       : this.windowRows(face, storeys, rng, { groundSkip: o.groundSkip, balconyRow: o.balconyRow });
-    const openings = [...win.openings, ...(o.extraOpenings ?? [])];
+    const breachHoles: Opening[] = (o.breaches ?? []).map((b) => ({
+      x: face.local(b.run),
+      y: Math.max(0.25, b.y - b.r),
+      w: b.r * 2.1,
+      h: b.r * 1.8,
+      raw: true,
+    }));
+    const openings = [...win.openings, ...(o.extraOpenings ?? []), ...breachHoles];
 
     const wall = wallWithOpenings(face.length, o.height, t, {
       openings,
       plinth: o.plinth === false ? 0 : 0.26,
       bandY: storeys > 1 ? FLOOR_H - 0.18 : undefined,
       twoLeaf: o.twoLeaf !== false,
-      reveal: 0.1,
+      // A 10cm rebate reads as a hole in card. 18cm plus the 23cm leaf step is
+      // half a metre of masonry you can see the thickness of from any angle.
+      reveal: 0.18,
       bevel: 0.022,
     });
 
@@ -651,7 +689,7 @@ export class LevelSystem implements System {
         const y = near
           ? Math.max(0.4, near.y + rng.jitter(1.3))
           : 0.3 + Math.pow(rng.next(), 1.7) * (o.height - 0.9);
-        const p = spallPatch(rng.range(0.7, 2.1), rng.range(0.5, 1.5), 0.02, o.seed * 31 + i * 17);
+        const p = spallPatch(rng.range(0.5, 1.35), rng.range(0.4, 0.95), 0.02, o.seed * 31 + i * 17);
         this.add(o.zone, 'brick', p, face.matrix(run, y, t * 0.5 + 0.004));
       }
     }
@@ -667,8 +705,103 @@ export class LevelSystem implements System {
       this.add(o.zone, 'stone', c, face.matrix(face.centre, o.height, 0));
     }
 
+    if (o.breaches) for (const b of o.breaches) this.shellHole(o.zone, face, t, b);
+
     if (o.detail !== false) this.decorate(o.zone, face, win.runs, t, rng);
     return { runs: win.runs };
+  }
+
+  /**
+   * Dresses a raw rectangular opening into a shell hole.
+   *
+   * The opening itself is punched by `wallWithOpenings` so you can genuinely
+   * see and shoot through it. What makes it read as damage rather than as a
+   * missing window is the rim: broken lumps of masonry left round the edge at
+   * random depths, render blown off in a wide irregular halo around it, rebar
+   * standing out of the bottom lip, soot fanning up the wall, and the material
+   * lying on the pavement underneath in the direction it was thrown.
+   */
+  private shellHole(
+    zone: string,
+    face: Face,
+    thickness: number,
+    b: { run: number; y: number; r: number; seed: number },
+  ): void {
+    const rng = new Rng(b.seed);
+    const halfT = thickness * 0.5;
+    // The punched opening is a rectangle; the rim has to sit on *its* perimeter.
+    // Ringing an ellipse round a rectangular hole puts half the lumps inside the
+    // void, where they hang in mid-air with nothing behind them — which is
+    // exactly what a swarm of floating cubes in front of a wall looks like.
+    const hw = b.r * 1.05;
+    const hh = b.r * 0.9;
+
+    const n = 14;
+    for (let i = 0; i < n; i++) {
+      const t = (i + rng.range(0.15, 0.85)) / n;
+      // Walk the rectangle perimeter, then push each lump a little outward into
+      // the solid wall so it always has masonry behind it.
+      const u = t * 4;
+      let ex: number;
+      let ey: number;
+      if (u < 1) { ex = -hw + 2 * hw * u; ey = -hh; }
+      else if (u < 2) { ex = hw; ey = -hh + 2 * hh * (u - 1); }
+      else if (u < 3) { ex = hw - 2 * hw * (u - 2); ey = hh; }
+      else { ex = -hw; ey = hh - 2 * hh * (u - 3); }
+      const push = rng.range(0.02, 0.18);
+      ex += Math.sign(ex) * push * (Math.abs(ex) > hw * 0.85 ? 1 : 0.3);
+      ey += Math.sign(ey) * push * (Math.abs(ey) > hh * 0.85 ? 1 : 0.3);
+
+      const s = rng.range(0.15, 0.36);
+      const g = bevelBox(s * rng.range(0.9, 1.8), s * rng.range(0.8, 1.5), thickness * rng.range(0.85, 1.15), s * 0.16);
+      // Kept close to the wall plane: these are lumps of the wall that did not
+      // come away, not rocks stuck to it.
+      g.rotateY(rng.jitter(0.22));
+      g.rotateZ(rng.jitter(0.3));
+      this.add(
+        zone,
+        'concrete',
+        g,
+        face.matrix(face.run(face.local(b.run) + ex), b.y + ey, rng.range(-0.04, 0.05)),
+      );
+    }
+
+    // Render blown off in a halo, heaviest below where the blast washed down.
+    for (let i = 0; i < 3; i++) {
+      const a = rng.range(0, Math.PI * 2);
+      const d = b.r * rng.range(1.1, 2.1);
+      const p = spallPatch(rng.range(0.6, 1.4), rng.range(0.5, 1.1), 0.022, b.seed * 17 + i);
+      this.add(zone, 'brick', p, face.matrix(
+        face.run(face.local(b.run) + Math.cos(a) * d),
+        Math.max(0.5, b.y + Math.sin(a) * d * 0.8 - b.r * 0.3),
+        halfT + 0.004,
+      ));
+    }
+
+    // Rebar out of the bottom lip. Two tufts, short: this is reinforcement
+    // sticking out of a broken slab edge, not scrub growing out of the wall.
+    for (let i = 0; i < 2; i++) {
+      const w = face.world(face.run(face.local(b.run) + rng.jitter(hw * 0.55)), b.y - hh * 0.85, halfT + 0.08);
+      this.props?.place('rebar_tuft', w.x, w.y, w.z, face.yaw + rng.jitter(0.5), rng.range(0.55, 0.85));
+    }
+
+    // Soot up the wall, and what came out of it on the ground below.
+    const centre = face.world(b.run, b.y, halfT);
+    this.scorch.push({ p: new THREE.Vector3(centre.x, centre.y + b.r * 0.55, centre.z), r: b.r * 3.6, s: 0.55 });
+    const foot = face.world(b.run, 0, halfT + b.r * 0.9);
+    const out = face.world(b.run, 0, halfT + 1);
+    const base = face.world(b.run, 0, halfT);
+    this.debrisCone(
+      zone,
+      foot.x,
+      this.groundHeight(foot.x, foot.z) + 0.01,
+      foot.z,
+      b.r * 1.5,
+      b.r * 0.32,
+      b.seed + 3,
+      out.x - base.x,
+      out.z - base.z,
+    );
   }
 
   /** Joinery, shutters, glass, balconies, downpipes. */
@@ -683,19 +816,32 @@ export class LevelSystem implements System {
       const setBack = thickness * 0.42;
       const roll = rng.next();
 
-      if (roll < 0.34) {
-        // Shuttered, one leaf usually ajar.
+      if (roll < 0.30) {
+        // Shuttered, one leaf usually ajar — and one in six hanging off its
+        // bottom hinge, which is the single detail that says "nobody has lived
+        // here for two years".
         const sw = w.w * 0.5 - 0.01;
         for (const side of [-1, 1]) {
-          const open = side > 0 && rng.chance(0.42) ? rng.range(0.5, 1.25) : rng.range(0.0, 0.05);
+          const hanging = side > 0 && rng.chance(0.17);
+          const open = hanging
+            ? rng.range(0.9, 1.5)
+            : side > 0 && rng.chance(0.42)
+              ? rng.range(0.5, 1.25)
+              : rng.range(0.0, 0.05);
           const g = shutterGeo(sw, w.h - 0.03);
           g.translate(side * sw * 0.5, 0, 0);
+          if (hanging) {
+            // Swing about the *bottom* corner as well, so it lolls forward.
+            g.translate(0, (w.h - 0.03) * 0.5, 0);
+            g.rotateZ(side * rng.range(0.25, 0.6));
+            g.translate(0, -(w.h - 0.03) * 0.5, 0);
+          }
           g.rotateY(-side * open);
           g.translate(-side * sw * 0.5, 0, 0);
           const run = w.run + face.runSign * side * sw * 0.5;
           this.add(zone, 'woodDark', g, face.matrix(run, w.y + w.h * 0.5, setBack * 0.4));
         }
-      } else if (roll < 0.74) {
+      } else if (roll < 0.60) {
         // Glazed, mostly broken.
         const frame = windowFrameGeo(w.w - 0.05, w.h - 0.05, 0.07);
         this.add(zone, 'woodDark', frame, face.matrix(w.run, w.y + w.h * 0.5, -setBack));
@@ -714,10 +860,55 @@ export class LevelSystem implements System {
           }
           for (const s of shards) this.add(zone, 'glass', s, face.matrix(w.run, w.y + w.h * 0.5, -setBack - 0.005));
         }
+      } else if (roll < 0.76) {
+        // Boarded up: planks nailed across the reveal at whatever angle came to
+        // hand, with gaps you can see the dark through.
+        const n = rng.int(3, 4);
+        for (let i = 0; i < n; i++) {
+          const pw = w.w + rng.range(0.06, 0.3);
+          const ph = rng.range(0.15, 0.26);
+          const py = -w.h * 0.42 + (w.h * 0.84 * (i + 0.5)) / n + rng.jitter(0.05);
+          const g = bevelBox(pw, ph, 0.032, 0.006);
+          g.rotateZ(rng.jitter(0.09));
+          this.add(zone, 'wood', g, face.matrix(w.run + face.runSign * rng.jitter(0.06), w.y + w.h * 0.5 + py, setBack * 0.2));
+        }
+        if (rng.chance(0.3)) {
+          const brace = bevelBox(Math.hypot(w.w, w.h) * 0.92, 0.19, 0.03, 0.006);
+          brace.rotateZ(Math.atan2(w.h, w.w) * rng.sign());
+          this.add(zone, 'wood', brace, face.matrix(w.run, w.y + w.h * 0.5, setBack * 0.2 + 0.03));
+        }
       }
       // The remainder are simply empty holes — a bombed street has plenty.
 
-      if (w.storey > 0 && w.h > 2.0) {
+      if (w.storey > 0 && w.h > 2.0 && rng.chance(0.16)) {
+        // Collapsed balcony: the slab has sheared at the wall and dropped on
+        // its brackets, the railing has gone over with it, and the whole thing
+        // is hanging. One of these per street is worth more than a hundred
+        // intact ones.
+        const tilt = rng.range(0.5, 0.95);
+        const slab = bevelBox(w.w + 0.9, 0.14, 1.05, 0.02);
+        const sm = face.matrix(w.run, w.y - 0.12 - Math.sin(tilt) * 0.5, 0.42, 0);
+        sm.multiply(matrixOf(0, 0, 0, 0, tilt, rng.jitter(0.12)));
+        this.add(zone, 'stone', slab, sm);
+        this.solid('concrete', [{ cx: 0, cy: 0, cz: 0, sx: w.w + 0.9, sy: 0.2, sz: 0.9 }], sm);
+        const rail = railingGeo(w.w + 0.7, 0.98, { balusterSpacing: 0.14 });
+        const rm = face.matrix(w.run + face.runSign * rng.jitter(0.2), w.y - 0.3 - Math.sin(tilt) * 0.95, 0.85, 0);
+        rm.multiply(matrixOf(0, 0, 0, 0, tilt + rng.range(0.1, 0.5), rng.jitter(0.25)));
+        this.add(zone, 'metalRust', rail, rm);
+        for (const sx of [-1, 1]) {
+          const bracket = bevelBox(0.1, 0.42, 0.6, 0.012);
+          bracket.rotateX(rng.range(0.6, 1.3));
+          this.add(zone, 'stone', bracket, face.matrix(w.run + sx * (w.w * 0.5 + 0.2), w.y - 0.4, 0.3));
+        }
+        // What fell off it, on the pavement directly below.
+        const foot = face.world(w.run, 0, 1.0);
+        this.debrisCone(
+          zone, foot.x, this.groundHeight(foot.x, foot.z) + 0.01, foot.z,
+          1.5, 0.34, Math.round(w.run * 71) + 5,
+          face.world(w.run, 0, 1).x - face.world(w.run, 0, 0).x,
+          face.world(w.run, 0, 1).z - face.world(w.run, 0, 0).z,
+        );
+      } else if (w.storey > 0 && w.h > 2.0) {
         // Balcony under the full-height openings.
         const slab = bevelBox(w.w + 0.9, 0.14, 1.05, 0.02);
         this.add(zone, 'stone', slab, face.matrix(w.run, w.y - 0.07, 0.5));
@@ -775,6 +966,7 @@ export class LevelSystem implements System {
     /** Elevations left completely blank (party walls). */
     blank?: Array<'n' | 's' | 'e' | 'w'>;
     extra?: Partial<Record<'n' | 's' | 'e' | 'w', Opening[]>>;
+    breaches?: Partial<Record<'n' | 's' | 'e' | 'w', { run: number; y: number; r: number; seed: number }[]>>;
     parapet?: number;
     noParapet?: Array<'n' | 's' | 'e' | 'w'>;
     roof?: boolean;
@@ -807,10 +999,11 @@ export class LevelSystem implements System {
         thickness: t,
         seed: o.seed + i * 137,
         extraOpenings: o.extra?.[k],
+        breaches: o.breaches?.[k],
         windows: !blank.has(k),
         detail: det,
         twoLeaf: det,
-        greeble: det ? 0 : 5,
+        greeble: det ? 0 : 3,
         cornice: det,
         balconyRow: det ? o.balconyRow : undefined,
         groundSkip: o.groundSkip,
@@ -838,7 +1031,7 @@ export class LevelSystem implements System {
     }
 
     if (o.roof !== false) {
-      const roof = this.groundGrid(o.x0 + t, o.z0 + t, o.x1 - t, o.z1 - t, base + o.height, 2.0, o.seed + 7, 0.02);
+      const roof = this.groundGrid(o.x0 + t, o.z0 + t, o.x1 - t, o.z1 - t, base + o.height, 1.5, o.seed + 7, 0.02);
       this.add(o.zone, 'concrete', roof);
       this.collider.addBox('concrete', {
         cx: (o.x0 + o.x1) * 0.5,
@@ -859,7 +1052,7 @@ export class LevelSystem implements System {
     if (!props || x1 <= x0 || z1 <= z0) return;
     const rng = new Rng(seed);
     const area = (x1 - x0) * (z1 - z0);
-    const n = Math.max(1, Math.round(area / 55));
+    const n = Math.max(1, Math.round(area / 82));
     for (let i = 0; i < n; i++) {
       const x = rng.range(x0, x1);
       const z = rng.range(z0, z1);
@@ -869,6 +1062,30 @@ export class LevelSystem implements System {
       else if (roll < 0.86) props.placeSolid(this.collider, 'barrel', x, y, z, rng.range(0, Math.PI * 2), 1);
       else props.place('rubble_chunk', x, y, z, rng.range(0, Math.PI * 2), rng.range(0.7, 1.3));
     }
+    // Stair head. Every flat roof in the world has one and it is the cheapest
+    // thing there is that breaks a roofline in silhouette — a 2.5m box on top
+    // of a 10m block is what stops the block reading as an extruded rectangle.
+    if ((x1 - x0) * (z1 - z0) > 46) {
+      const sw = rng.range(2.2, 3.1);
+      const sd = rng.range(2.0, 2.8);
+      const sh = rng.range(2.3, 3.1);
+      const sx = rng.range(x0 + sw * 0.5, x1 - sw * 0.5);
+      const sz = rng.range(z0 + sd * 0.5, z1 - sd * 0.5);
+      const box = bevelBox(sw, sh, sd, 0.03);
+      this.add(zone, 'plasterWhite', box, matrixOf(sx, y + sh * 0.5, sz, rng.jitter(0.05)));
+      this.collider.addBox('plaster', { cx: sx, cy: y + sh * 0.5, cz: sz, sx: sw, sy: sh, sz: sd });
+      const cap = bevelBox(sw + 0.3, 0.16, sd + 0.3, 0.02);
+      this.add(zone, 'stone', cap, matrixOf(sx, y + sh + 0.08, sz, 0));
+      // A door out onto the roof, and a dark opening behind it.
+      const dir = rng.chance(0.5) ? 1 : -1;
+      this.add(zone, 'interiorDark', plainBox(1.05, 2.1, 0.12), matrixOf(sx, y + 1.05, sz + dir * (sd * 0.5 - 0.04), 0));
+      this.add(zone, 'woodDark', doorGeo(1.0, 2.05), matrixOf(sx + 0.1, y + 1.02, sz + dir * (sd * 0.5 + 0.03), dir > 0 ? 0 : Math.PI));
+      if (rng.chance(0.6)) {
+        const vent = cylinderGeo(0.11, 0.11, 0.9, 8);
+        this.add(zone, 'metalRust', vent, matrixOf(sx + sw * 0.3, y + sh + 0.5, sz, 0));
+      }
+    }
+
     // A cistern tank: reads instantly as a Mediterranean rooftop.
     if (rng.chance(0.65)) {
       const tank = cylinderGeo(0.62, 0.62, 1.05, 14);
@@ -912,6 +1129,9 @@ export class LevelSystem implements System {
       zone: 'west', mat: 'plasterOchre', x0: -26, z0: -16, x1: -6.8, z1: -6,
       height: 10.7, seed: 1002, detailed: ['e'], blank: ['w', 'n', 's'], parapet: 1.0, balconyRow: 1, enterable: true,
       groundSkip: true,
+      // Straight up the hero sightline and across the skyline pose: the one
+      // piece of heavy damage on the west terrace.
+      breaches: { e: [{ run: -11.6, y: 6.6, r: 1.3, seed: 8801 }] },
       extra: {
         e: [{ x: faceLocal('z', -16, -6, 1, -11), y: 0, w: 6.4, h: 3.05 }],
         // Door from the second floor out onto bay A's terrace.
@@ -921,6 +1141,7 @@ export class LevelSystem implements System {
     this.shell({
       zone: 'west', mat: 'plasterWhite', x0: -26, z0: -6, x1: -7.1, z1: 2,
       height: 10.2, seed: 1003, detailed: ['e', 's'], blank: ['w', 'n'], parapet: 0.9, balconyRow: 1, enterable: true,
+      breaches: { e: [{ run: -2.6, y: 7.3, r: 1.0, seed: 8802 }] },
       extra: { e: [{ x: faceLocal('z', -6, 2, 1, -2), y: 0, w: 1.3, h: 2.35 }] },
     });
 
@@ -986,7 +1207,7 @@ export class LevelSystem implements System {
     ] as const) {
       const lip = bevelBox(w, 0.26, d, 0.02);
       this.add('west', 'concrete', lip, matrixOf(x, FLOOR_H * 2 - 0.14, z, yaw));
-      this.props?.place('rebar_tuft', x, FLOOR_H * 2 - 0.3, z, yaw, 0.9);
+      this.props?.place('rebar_tuft', x, FLOOR_H * 2 - 0.3, z, yaw, 0.7);
     }
     this.debrisCone('west', -15.4, 0.0, -11.0, 3.4, 1.0, 812);
 
@@ -1105,11 +1326,29 @@ export class LevelSystem implements System {
     y: number,
   ): void {
     if (x1 <= x0 || z1 <= z0) return;
-    const g = this.groundGrid(x0, z0, x1, z1, y, 1.6, Math.round((x0 + z0) * 13) + 7, 0.008);
+    const g = this.groundGrid(x0, z0, x1, z1, y, 1.0, Math.round((x0 + z0) * 13) + 7, 0.008);
     this.add(zone, mat, g);
     if (y > 0.05) {
       const under = bevelBox(x1 - x0, 0.24, z1 - z0, 0.02);
       this.add(zone, 'concrete', under, matrixOf((x0 + x1) * 0.5, y - 0.17, (z0 + z1) * 0.5, 0));
+      // Downstand beams. A ceiling that is one flat slab is the interior
+      // equivalent of an untextured wall: nothing for the light to break over,
+      // no scale reference, and no shadow anywhere in the top third of the
+      // frame. Six boxes fix all three.
+      // Only where there is actually a room under the slab; a few of these
+      // "floors" are 12cm plinths and their beams would be underground.
+      const spanX = x1 - x0 >= z1 - z0;
+      const run = spanX ? z1 - z0 : x1 - x0;
+      const n = y < 1.5 ? 0 : Math.max(1, Math.min(7, Math.round(run / 2.6)));
+      for (let i = 1; i <= n; i++) {
+        const t = i / (n + 1);
+        const beam = spanX
+          ? bevelBox(x1 - x0 - 0.1, 0.34, 0.28, 0.018)
+          : bevelBox(0.28, 0.34, z1 - z0 - 0.1, 0.018);
+        const bx = spanX ? (x0 + x1) * 0.5 : x0 + (x1 - x0) * t;
+        const bz = spanX ? z0 + (z1 - z0) * t : (z0 + z1) * 0.5;
+        this.add(zone, 'concrete', beam, matrixOf(bx, y - 0.46, bz, 0));
+      }
     }
     this.collider.addBox('concrete', {
       cx: (x0 + x1) * 0.5,
@@ -1167,7 +1406,7 @@ export class LevelSystem implements System {
     const ceiling = bevelBox(3.5, 0.3, z1 - z0, 0.02);
     this.add('west', 'plasterRose', ceiling, matrixOf(-12.05, archH + 0.15, (z0 + z1) * 0.5, 0));
     this.collider.addBox('plaster', { cx: -12.05, cy: archH + 0.15, cz: (z0 + z1) * 0.5, sx: 3.5, sy: 0.3, sz: z1 - z0 });
-    const roofSpan = this.groundGrid(-13.8, z0, colX, z1, 7.2, 2.0, 1155, 0.02);
+    const roofSpan = this.groundGrid(-13.8, z0, colX, z1, 7.2, 1.5, 1155, 0.02);
     this.add('west', 'concrete', roofSpan);
     this.collider.addBox('concrete', { cx: -12.1, cy: 7.04, cz: (z0 + z1) * 0.5, sx: 3.4, sy: 0.32, sz: z1 - z0 });
     this.floors.push({ x0: -13.8, z0, x1: colX, z1, y: 7.2 });
@@ -1212,6 +1451,7 @@ export class LevelSystem implements System {
     this.shell({
       zone: 'east', mat: 'plasterBlue', x0: 9.5, z0: 2, x1: 22, z1: 20,
       height: 7.6, seed: 2001, detailed: ['w', 'n'], blank: ['e'], parapet: 0.9, balconyRow: 1,
+      breaches: { w: [{ run: 13.2, y: 5.3, r: 1.15, seed: 8803 }] },
       extra: { w: [{ x: faceLocal('z', 2, 20, -1, 6.4), y: 0, w: 3.2, h: 2.8 }] },
     });
     this.buildCafeFront();
@@ -1467,23 +1707,80 @@ export class LevelSystem implements System {
       this.props?.placeSolid(this.collider, 'tyre', rng.range(24, 29), 0.03 + i * 0.22, -26.5 + rng.jitter(0.1), rng.range(0, 3.14));
     }
 
-    // Debris cone spilling *into* the room, in the direction the blast travelled.
-    this.debrisCone('east', 18.6, 0.03, -18, 3.6, 0.85, 900);
-    this.debrisCone('east', 17.3, 0.03, -25.5, 2.0, 0.5, 901);
+    // Debris cones spilling *into* the room, in the direction the blast
+    // travelled — and a smaller one back out onto the square, because a shell
+    // that goes through a wall throws material both ways.
+    this.debrisCone('east', 17.9, 0.03, -18, 3.2, 0.85, 900, 1, 0.12);
+    this.debrisCone('east', 17.0, 0.03, -25.5, 1.9, 0.5, 901, 1, -0.2);
+    this.debrisCone('mid', 15.1, 0.02, -18.0, 2.4, 0.42, 902, -1, 0.1);
   }
 
-  /** Rubble fanning out from a breach, plus rebar and dust staining. */
-  private debrisCone(zone: string, x: number, y: number, z: number, radius: number, height: number, seed: number): void {
-    const cone = rubbleCone(radius, height, Math.round(13 + radius * 4), seed);
+  /**
+   * Rubble spilling from a breach, plus rebar, loose chunks and a scorch halo.
+   *
+   * `dx,dz` is the direction the blast travelled. Debris that has been thrown
+   * is not a heap: it is a fan, densest at the wall, thinning and getting finer
+   * downrange, with the odd big piece flung well clear. Everything on this map
+   * that has been hit spills the way it was hit.
+   */
+  private debrisCone(
+    zone: string,
+    x: number,
+    y: number,
+    z: number,
+    radius: number,
+    height: number,
+    seed: number,
+    dx = 0,
+    dz = 0,
+  ): void {
+    const rng0 = new Rng(seed);
+    const yaw = dx === 0 && dz === 0 ? rng0.range(0, 6.28) : 0;
+    // Soot radiating from the seat of it, biased downrange.
+    const sl = Math.hypot(dx, dz);
+    this.scorch.push({
+      p: new THREE.Vector3(x + (sl > 1e-4 ? (dx / sl) * radius * 0.7 : 0), y + 0.1, z + (sl > 1e-4 ? (dz / sl) * radius * 0.7 : 0)),
+      r: radius * 2.3,
+      s: 0.52,
+    });
+    const cone = rubbleCone(radius, height, Math.round(9 + radius * 2.6), seed, {
+      throwX: dx,
+      throwZ: dz,
+      reach: 2.4,
+      spread: 0.8,
+    });
     scaleUv(cone, 1.4);
-    this.add(zone, 'rubble', cone, matrixOf(x, y, z, new Rng(seed).range(0, 6.28)));
+    this.add(zone, 'rubble', cone, matrixOf(x, y, z, yaw));
     this.collider.addBox('concrete', { cx: x, cy: y + height * 0.28, cz: z, sx: radius * 1.2, sy: height * 0.55, sz: radius * 1.2 });
+
     const rng = new Rng(seed + 1);
-    for (let i = 0; i < 4; i++) {
-      this.props?.place('rebar_tuft', x + rng.jitter(radius * 0.7), y + rng.range(0.1, 0.5), z + rng.jitter(radius * 0.7), rng.range(0, 6.28), rng.range(0.7, 1.3));
+    const throwLen = Math.hypot(dx, dz);
+    const ux = throwLen > 1e-4 ? dx / throwLen : 0;
+    const uz = throwLen > 1e-4 ? dz / throwLen : 0;
+    for (let i = 0; i < 3; i++) {
+      this.props?.place('rebar_tuft', x + rng.jitter(radius * 0.7), y + rng.range(0.08, 0.35), z + rng.jitter(radius * 0.7), rng.range(0, 6.28), rng.range(0.55, 0.9));
     }
-    for (let i = 0; i < 7; i++) {
-      this.props?.place('rubble_chunk', x + rng.jitter(radius * 1.4), y, z + rng.jitter(radius * 1.4), rng.range(0, 6.28), rng.range(0.7, 1.4));
+    // Chunks strung out downrange, dust and paper further still.
+    for (let i = 0; i < 5; i++) {
+      const t = Math.pow(rng.next(), 0.6);
+      const along = t * radius * 3.0;
+      const lat = rng.jitter(radius * (0.5 + t * 0.9));
+      const px = x + ux * along - uz * lat + (throwLen > 1e-4 ? 0 : rng.jitter(radius * 1.4));
+      const pz = z + uz * along + ux * lat + (throwLen > 1e-4 ? 0 : rng.jitter(radius * 1.4));
+      this.props?.place('rubble_chunk', px, y, pz, rng.range(0, 6.28), rng.range(0.55, 1.4) * (1 - t * 0.4));
+      if (rng.chance(0.4)) this.props?.place('brick_shard', px + rng.jitter(0.7), y, pz + rng.jitter(0.7), rng.range(0, 6.28), rng.range(0.7, 1.3));
+      if (rng.chance(0.3)) this.props?.place('gravel', px + rng.jitter(1.1), y, pz + rng.jitter(1.1), rng.range(0, 6.28), rng.range(0.8, 1.5));
+    }
+    for (let i = 0; i < 3; i++) {
+      const t = 0.4 + rng.next() * 1.6;
+      this.props?.place(
+        'paper',
+        x + ux * radius * 2.6 * t + rng.jitter(radius),
+        y,
+        z + uz * radius * 2.6 * t + rng.jitter(radius),
+        rng.range(0, 6.28),
+        rng.range(0.7, 1.2),
+      );
     }
   }
 
@@ -1496,6 +1793,284 @@ export class LevelSystem implements System {
     this.archBlock('north', 'plasterCream', -30, -42, 30, -34, 12.5, 0.5, 4.6, 5001);
     // South: the same idea, lower, offset arch so the two vistas differ.
     this.archBlock('south', 'plasterOchre', -30, 34, 30, 42, 11.0, -1.0, 4.2, 5002);
+
+    // ---- Skyline. Both fixed vistas run the length of the street and end on
+    // one of these blocks; left flat they are a 60m horizontal bar across the
+    // top of the frame and the composition has nowhere to go. A stepped crown,
+    // a section that has been blown off it, and one tower three times the
+    // height of the street wall is what turns each vista into a picture.
+
+    // North crown: a tall west wing, a bombed-out centre-east, low parapet
+    // beyond it. The step reads from the hero pose 47m down the street.
+    this.crownRun('north', 'plasterCream', -30, -6.5, -41.6, -34.4, 13.85, 3.5, 5101);
+    this.crownRun('north', 'plasterCream', -6.5, 5.0, -41.4, -34.6, 13.85, 1.6, 5102);
+    this.brokenCrest('north', 'plasterCream', 13.5, 24.0, -41.0, -35.0, 13.85, 3.2, 5103);
+    this.crownRun('north', 'plasterCream', 24.0, 30, -41.6, -34.4, 13.85, 2.2, 5104);
+
+    // Tower placement is a framing decision, not a plan decision. The hero pose
+    // looks up a corridor whose only open sky is between the west block's edge
+    // and the warehouse; anything outside that wedge is behind a facade at 15m
+    // and will never be seen. So it stands just east of the arch, inside the
+    // wedge, tall enough to clear the warehouse roof behind it.
+    this.buildTower({
+      zone: 'north', mat: 'plasterCream', x: 9.4, z: -38.2, size: 5.2,
+      height: 21.5, seed: 5201, broken: true,
+    });
+
+    // South crown: lower and busier, with the campanile as the focal point of
+    // the skyline pose.
+    this.crownRun('south', 'plasterOchre', -30, -12.0, 34.4, 41.6, 12.35, 2.4, 5111);
+    this.brokenCrest('south', 'plasterOchre', -12.0, 2.0, 35.0, 41.0, 12.35, 2.8, 5112);
+    this.crownRun('south', 'plasterOchre', 2.0, 16.0, 34.6, 41.4, 12.35, 4.1, 5113);
+    this.crownRun('south', 'plasterOchre', 16.0, 30, 34.4, 41.6, 12.35, 1.8, 5114);
+
+    this.buildTower({
+      zone: 'south', mat: 'plasterOchre', x: 8.0, z: 37.4, size: 5.0,
+      height: 23.5, seed: 5202,
+    });
+  }
+
+  /**
+   * A setback storey on the crown of an end block: mass, coping, a couple of
+   * openings so it does not read as a solid billboard, and a shadow line where
+   * it steps back from the elevation below.
+   */
+  private crownRun(
+    zone: string,
+    mat: MatKey,
+    x0: number,
+    x1: number,
+    z0: number,
+    z1: number,
+    baseY: number,
+    height: number,
+    seed: number,
+  ): void {
+    if (x1 - x0 < 1 || height < 0.5) return;
+    const rng = new Rng(seed);
+    const w = x1 - x0;
+    const d = z1 - z0;
+    const cx = (x0 + x1) * 0.5;
+    const cz = (z0 + z1) * 0.5;
+
+    const g = bevelBox(w, height, d, 0.035);
+    this.add(zone, mat, g, matrixOf(cx, baseY + height * 0.5, cz, 0));
+    this.collider.addBox('concrete', { cx, cy: baseY + height * 0.5, cz, sx: w, sy: height, sz: d });
+
+    // Coping all the way round: one continuous highlight along the top edge is
+    // what separates a parapet from an extruded rectangle.
+    for (const [len, yaw, ox, oz] of [
+      [w, 0, 0, -d * 0.5], [w, Math.PI, 0, d * 0.5],
+      [d, Math.PI * 0.5, -w * 0.5, 0], [d, -Math.PI * 0.5, w * 0.5, 0],
+    ] as const) {
+      const cop = extrudeProfile(copingProfile(0.46, 0.12), len + 0.1, { bevel: 0.009 });
+      cop.rotateY(-Math.PI * 0.5);
+      this.add(zone, 'stone', cop, matrixOf(cx + ox, baseY + height, cz + oz, yaw));
+    }
+
+    // Openings on the street elevation only, and only if the run is tall enough
+    // to carry them.
+    if (height > 2.2) {
+      const face = new Face('x', x0 + 0.6, x1 - 0.6, z0 < 0 ? z1 : z0, z0 < 0 ? 1 : -1, baseY);
+      const n = Math.max(1, Math.round(face.length / 3.4));
+      for (let i = 0; i < n; i++) {
+        if (rng.chance(0.25)) continue;
+        const run = face.from + (face.to - face.from) * ((i + 0.5) / n);
+        const ow = rng.range(0.85, 1.15);
+        const oh = Math.min(height - 1.0, rng.range(1.1, 1.5));
+        const hole = bevelBox(ow, oh, 0.7, 0.02);
+        this.add('ends', 'interiorDark', hole, face.matrix(run, height * 0.45, -0.22));
+        const s = extrudeProfile(sillProfile(0.17, 0.09), ow + 0.26, { bevel: 0.008 });
+        s.rotateY(-Math.PI * 0.5);
+        this.add(zone, 'stone', s, face.matrix(run, height * 0.45 - oh * 0.5, 0.04));
+      }
+    }
+  }
+
+  /**
+   * The same crown with a shell through it. A run of stumps at wildly different
+   * heights, rebar standing out of the tallest, and the material that came off
+   * it lying on the roof behind. Silhouette does the work here — a broken
+   * skyline reads as damage from 50m in a way that no amount of soot decal on a
+   * straight parapet ever will.
+   */
+  private brokenCrest(
+    zone: string,
+    mat: MatKey,
+    x0: number,
+    x1: number,
+    z0: number,
+    z1: number,
+    baseY: number,
+    height: number,
+    seed: number,
+  ): void {
+    const rng = new Rng(seed);
+    const d = z1 - z0;
+    const cz = (z0 + z1) * 0.5;
+    const span = x1 - x0;
+    // Blast centre: everything near it is gone, the stumps grow back to full
+    // height toward the edges.
+    const blast = x0 + span * rng.range(0.35, 0.62);
+    let x = x0;
+    let i = 0;
+    while (x < x1 - 0.05) {
+      const w = Math.min(x1 - x, rng.range(0.7, 2.1));
+      const cx = x + w * 0.5;
+      const away = Math.min(1, Math.abs(cx - blast) / (span * 0.42));
+      const h = height * (0.1 + Math.pow(away, 1.4) * 0.9) * rng.range(0.75, 1.12);
+      if (h > 0.22) {
+        const dd = d * rng.range(0.55, 1.0);
+        const g = bevelBox(w * 1.06, h, dd, 0.03);
+        this.add(zone, mat, g, matrixOf(cx, baseY + h * 0.5, cz + rng.jitter(d * 0.12), rng.jitter(0.03)));
+        this.collider.addBox('concrete', { cx, cy: baseY + h * 0.5, cz, sx: w, sy: h, sz: dd });
+        if (h > height * 0.5) {
+          const cop = extrudeProfile(copingProfile(0.44, 0.11), w * 0.9, { bevel: 0.008 });
+          cop.rotateY(-Math.PI * 0.5);
+          this.add(zone, 'stone', cop, matrixOf(cx, baseY + h, cz + dd * 0.5 - d * 0.5, 0));
+        }
+        if (rng.chance(0.4)) {
+          this.props?.place('rebar_tuft', cx, baseY + h - 0.08, cz + rng.jitter(d * 0.25), rng.range(0, 6.28), rng.range(0.6, 1.0));
+        }
+      }
+      x += w;
+      i++;
+    }
+    // What came off it: on the roof behind, and thrown down onto the street.
+    this.debrisCone(zone, blast, baseY, cz + d * 0.1, 2.4, 0.7, seed + 5, 0, z0 < 0 ? -0.4 : 0.4);
+    const front = z0 < 0 ? z1 + 2.4 : z0 - 2.4;
+    this.debrisCone(zone, blast, 0.01, front, 3.0, 0.95, seed + 6, 0, z0 < 0 ? 1 : -1);
+  }
+
+  /**
+   * A masonry tower: plinth, tapering shaft with slit windows and string
+   * courses, an open belfry, a pyramid cap. `broken` takes the cap off and
+   * leaves the top storey as a stump with its floor slab hanging.
+   */
+  private buildTower(o: {
+    zone: string;
+    mat: MatKey;
+    x: number;
+    z: number;
+    size: number;
+    height: number;
+    seed: number;
+    broken?: boolean;
+  }): void {
+    const rng = new Rng(o.seed);
+    const s = o.size;
+    const half = s * 0.5;
+    const t = 0.5;
+    const belfryH = s * 1.05;
+    const shaftH = o.height - belfryH;
+
+    // Plinth.
+    const plinth = bevelBox(s + 0.7, 0.85, s + 0.7, 0.04);
+    this.add(o.zone, 'stone', plinth, matrixOf(o.x, 0.42, o.z, 0));
+    this.collider.addBox('concrete', { cx: o.x, cy: 0.42, cz: o.z, sx: s + 0.7, sy: 0.85, sz: s + 0.7 });
+
+    // Shaft: four elevations, each with a vertical row of slits. They are
+    // narrow on purpose — a tower reads by the ratio of solid to void, and a
+    // tower with domestic windows in it reads as a thin building.
+    const faces: Face[] = [
+      new Face('x', o.x - half, o.x + half, o.z - half, -1, 0.8),
+      new Face('x', o.x - half, o.x + half, o.z + half, 1, 0.8),
+      new Face('z', o.z - half + t, o.z + half - t, o.x - half, -1, 0.8),
+      new Face('z', o.z - half + t, o.z + half - t, o.x + half, 1, 0.8),
+    ];
+    for (let f = 0; f < faces.length; f++) {
+      const face = faces[f];
+      const openings: Opening[] = [];
+      const levels = Math.max(2, Math.floor(shaftH / 4.6));
+      for (let i = 0; i < levels; i++) {
+        if (rng.chance(0.18)) continue;
+        openings.push({ x: rng.jitter(0.25), y: 2.6 + i * (shaftH - 4.0) / levels, w: 0.62, h: 1.55 });
+      }
+      const wall = wallWithOpenings(face.length, shaftH - 0.8, t, {
+        openings, twoLeaf: true, reveal: 0.14, bevel: 0.026, plinth: 0, sills: true, lintels: true,
+      });
+      const m = face.matrix(face.centre, 0, -t * 0.5);
+      this.add(o.zone, o.mat, wall.geometry, m);
+      this.solid(this.kindOf(o.mat), wall.boxes, m);
+      // A dark reveal behind every slit; a tower with lit holes reads hollow.
+      for (const op of openings) {
+        this.add('ends', 'interiorDark', plainBox(op.w + 0.4, op.h + 0.4, 0.1), face.matrix(face.run(op.x), op.y + op.h * 0.5, -1.0));
+      }
+      // String courses.
+      for (const frac of [0.34, 0.68]) {
+        const band = extrudeProfile(
+          [new THREE.Vector2(0, 0.11), new THREE.Vector2(0.13, 0.09), new THREE.Vector2(0.15, -0.02), new THREE.Vector2(0, -0.08)],
+          face.length + 0.02,
+          { bevel: 0.008 },
+        );
+        band.rotateY(-Math.PI * 0.5);
+        this.add(o.zone, 'stone', band, face.matrix(face.centre, 0.8 + shaftH * frac, 0.0));
+      }
+      // Spalled render, heavier low down where the street has chewed at it.
+    }
+    this.collider.addBox('concrete', { cx: o.x, cy: 0.8 + (shaftH - 0.8) * 0.5, cz: o.z, sx: s, sy: shaftH - 0.8, sz: s });
+
+    // Cornice under the belfry.
+    for (const face of faces.slice(0, 2)) {
+      const c = extrudeProfile(corniceProfile(0.36, 0.42), s + 0.6, { bevel: 0.012 });
+      c.rotateY(-Math.PI * 0.5);
+      this.add(o.zone, 'stone', c, face.matrix(face.centre, shaftH, 0.0));
+    }
+    for (const face of faces.slice(2)) {
+      const c = extrudeProfile(corniceProfile(0.36, 0.42), s - t * 2 + 0.6, { bevel: 0.012 });
+      c.rotateY(-Math.PI * 0.5);
+      this.add(o.zone, 'stone', c, face.matrix(face.centre, shaftH, 0.0));
+    }
+
+    // Belfry: four arched openings, so the top is a lantern and not a lump.
+    for (let f = 0; f < 4; f++) {
+      const face = faces[f];
+      const a = archway(face.length, belfryH, 0.42, s * 0.5, belfryH * 0.52, belfryH * 0.28, 0.02);
+      const m = face.matrix(face.centre, shaftH + 0.05, -0.21);
+      this.add(o.zone, o.mat, a.geometry, m);
+      this.solid(this.kindOf(o.mat), a.boxes, m);
+    }
+    // Something inside the lantern to catch light, and a dark backing so it is
+    // not a window onto the sky.
+    const bellFrame = bevelBox(s * 0.72, 0.16, 0.16, 0.014);
+    this.add(o.zone, 'stone', bellFrame, matrixOf(o.x, shaftH + belfryH * 0.82, o.z, 0));
+    const bell = cylinderGeo(0.16, 0.42, 0.62, 10);
+    this.add(o.zone, 'stone', bell, matrixOf(o.x, shaftH + belfryH * 0.5, o.z, 0));
+
+    if (o.broken) {
+      // Cap gone: a jagged crest and the material that came off it.
+      const crest = new GeoBuilder();
+      for (let i = 0; i < 9; i++) {
+        const a = (i / 9) * Math.PI * 2;
+        const h = rng.range(0.12, 0.75);
+        const b = bevelBox(rng.range(0.5, 1.1), h, 0.42, 0.025);
+        crest.add(b, matrixOf(
+          o.x + Math.cos(a) * (half - 0.2),
+          shaftH + belfryH + h * 0.5,
+          o.z + Math.sin(a) * (half - 0.2),
+          -a,
+        ));
+      }
+      const cg = crest.build();
+      if (cg) this.add(o.zone, o.mat, cg);
+      for (let i = 0; i < 3; i++) {
+        this.props?.place('rebar_tuft', o.x + rng.jitter(half * 0.8), shaftH + belfryH + 0.08, o.z + rng.jitter(half * 0.8), rng.range(0, 6.28), rng.range(0.7, 1.1));
+      }
+      this.debrisCone(o.zone, o.x + rng.jitter(1.4), 0.02, o.z + (o.z < 0 ? 3.4 : -3.4), 3.4, 1.0, o.seed + 71, 0, o.z < 0 ? 1 : -1);
+    } else {
+      // Shallow pyramid cap on a moulded band. Four facets, sharp ridge, and a
+      // finial that gives the silhouette a point to end on.
+      const band = bevelBox(s + 0.34, 0.34, s + 0.34, 0.03);
+      this.add(o.zone, 'stone', band, matrixOf(o.x, shaftH + belfryH + 0.17, o.z, 0));
+      const cap = cylinderGeo(0.02, (s + 0.34) * 0.72, s * 0.62, 4);
+      this.add(o.zone, 'stone', cap, matrixOf(o.x, shaftH + belfryH + 0.34 + s * 0.31, o.z, Math.PI * 0.25));
+      const finial = cylinderGeo(0.04, 0.14, 0.75, 6);
+      this.add(o.zone, 'stone', finial, matrixOf(o.x, shaftH + belfryH + 0.34 + s * 0.62 + 0.3, o.z, 0));
+    }
+
+    this.collider.addBox('concrete', {
+      cx: o.x, cy: shaftH + belfryH * 0.5, cz: o.z, sx: s, sy: belfryH, sz: s,
+    });
   }
 
   private archBlock(
@@ -1600,8 +2175,9 @@ export class LevelSystem implements System {
       cx: (x0 + x1) * 0.5, cy: height + 0.68, cz: (z0 + z1) * 0.5, sx: x1 - x0, sy: 1.35, sz: depth * 0.9,
     });
 
-    // Rubble spilling toward the street from the damaged end.
-    this.debrisCone(zone, cx, 0, faceZ + outward * 2.6, 4.2, 1.2, seed + 33);
+    // Rubble spilling toward the street from the damaged end, thrown the way
+    // the building fell.
+    this.debrisCone(zone, cx, 0, faceZ + outward * 1.9, 3.8, 1.25, seed + 33, outward * 0.25, outward);
 
     this.floors.push({ x0, z0, x1, z1, y: 0 });
   }
@@ -1645,16 +2221,23 @@ export class LevelSystem implements System {
       const w = rng.range(9, 26);
       const d = rng.range(9, 26);
       const hh = rng.range(7, 34) * (1 - r / 260);
-      const g = bevelBox(w, hh, d, 0.12);
+      // 70m+ out and behind the fog: a chamfer here is smaller than a pixel
+      // and costs 3.6x the triangles of the box it is on.
+      const g = plainBox(w, hh, d);
       sky.add(g, matrixOf(Math.cos(a) * r, hh * 0.5, Math.sin(a) * r, rng.range(0, 1.57)));
       if (rng.chance(0.4)) {
-        const cap = bevelBox(w * 0.4, hh * 0.28, d * 0.4, 0.08);
+        const cap = plainBox(w * 0.4, hh * 0.28, d * 0.4);
         sky.add(cap, matrixOf(Math.cos(a) * r + rng.jitter(w * 0.2), hh + hh * 0.14, Math.sin(a) * r + rng.jitter(d * 0.2), 0));
       }
     }
     const skyGeo = sky.build();
     if (skyGeo) {
       tintGeometry(skyGeo, 0xb9ad97);
+      // Aerial perspective. Fog in the pipeline handles the value shift, but
+      // the far massing also has to lose *chroma* and contrast or it sits in
+      // the same plane as the street wall 12m away. Lifting the albedo toward
+      // the horizon colour is what puts 200m of air in front of it.
+      paintAerial(skyGeo, 0, 0, 60, 220, 0x9fb2c6, 0.82);
       const mesh = new THREE.Mesh(skyGeo, this.vault!.get('plaster_painted', { seed: 99, color: 0xc4b79f, roughness: 1.1 }));
       mesh.castShadow = false;
       mesh.receiveShadow = false;
@@ -1747,13 +2330,168 @@ export class LevelSystem implements System {
       }
     }
 
-    // Rubble drifts where the buildings have shed material.
-    for (const [x, z, r, h, s] of [
-      [-6.2, -16.0, 3.0, 0.7, 701], [-6.6, -3.4, 2.2, 0.5, 702],
-      [16.4, -6.2, 2.6, 0.6, 703], [-27.2, 6.0, 2.4, 0.55, 704],
-      [21.0, 21.5, 2.2, 0.5, 705], [-16.0, -27.0, 2.8, 0.65, 706],
+    this.collapsedSlabs();
+
+    // Rubble drifts where the buildings have shed material. Each one spills
+    // away from the wall that dropped it, not in a tidy ring around itself.
+    for (const [x, z, r, h, s, dx, dz] of [
+      [-6.2, -16.0, 2.6, 0.7, 701, 1, 0.2],
+      [-6.6, -3.4, 2.0, 0.5, 702, 1, -0.3],
+      [16.4, -6.2, 2.4, 0.6, 703, -1, 0.35],
+      [-27.2, 6.0, 2.2, 0.55, 704, 1, 0.1],
+      [21.0, 21.5, 2.0, 0.5, 705, -0.6, -1],
+      [-16.0, -27.0, 2.6, 0.65, 706, 0.2, 1],
     ] as const) {
-      this.debrisCone('mid', x, 0, z, r, h, s);
+      this.debrisCone('mid', x, 0, z, r, h, s, dx, dz);
+    }
+  }
+
+  /**
+   * Utility poles and the wires between them.
+   *
+   * Both fixed vistas are a street corridor with a band of empty sky down the
+   * middle of the frame. Catenaries crossing that band cost a few hundred
+   * triangles and give the composition leading lines, a sense of the volume of
+   * air over the street, and a silhouette element at a scale nothing else on
+   * the map occupies. Every reference frame of a built-up engagement has them.
+   */
+  private buildUtilities(): void {
+    const rng = new Rng(0x7017);
+
+    // Zones here are chosen to land in buckets the map already has, so a pole
+    // and a hundred metres of wire cost zero extra draw calls.
+    interface Pole { x: number; z: number; h: number; lean: number; zone: string; }
+    const poles: Pole[] = [
+      { x: 8.7, z: -6.6, h: 8.6, lean: 0.035, zone: 'east' },
+      { x: 10.4, z: -24.6, h: 9.3, lean: -0.05, zone: 'east' },
+      { x: 7.85, z: 12.2, h: 8.1, lean: 0.06, zone: 'east' },
+      { x: -8.9, z: 4.4, h: 7.6, lean: -0.03, zone: 'west' },
+    ];
+
+    for (const p of poles) {
+      const y0 = this.groundHeight(p.x, p.z);
+      const trunk = cylinderGeo(0.13, 0.19, p.h, 8);
+      const m = matrixOf(p.x, y0 + p.h * 0.5, p.z, rng.range(0, 6.28), p.lean, p.lean * 0.6);
+      this.add(p.zone, 'woodDark', trunk, m);
+      this.collider.addBox('wood', { cx: p.x, cy: y0 + p.h * 0.5, cz: p.z, sx: 0.36, sy: p.h, sz: 0.36 });
+
+      // Two crossarms with insulators, and a transformer can on the tallest.
+      for (const [dy, len] of [[-0.55, 1.9], [-1.35, 1.45]] as const) {
+        const yaw = rng.range(0, 3.14);
+        const arm = bevelBox(len, 0.11, 0.13, 0.014);
+        this.add(p.zone, 'woodDark', arm, matrixOf(p.x, y0 + p.h + dy, p.z, yaw));
+        for (const s of [-1, 0, 1]) {
+          if (s === 0 && rng.chance(0.5)) continue;
+          const ins = cylinderGeo(0.045, 0.06, 0.13, 6);
+          this.add(p.zone, 'stone', ins, matrixOf(
+            p.x + Math.cos(yaw) * s * len * 0.42,
+            y0 + p.h + dy + 0.11,
+            p.z - Math.sin(yaw) * s * len * 0.42,
+            0,
+          ));
+        }
+      }
+      if (rng.chance(0.6)) {
+        const can = cylinderGeo(0.24, 0.24, 0.62, 10);
+        this.add(p.zone, 'metalRust', can, matrixOf(p.x + 0.3, y0 + p.h - 2.4, p.z, 0));
+      }
+      // Everything collects at the base of a pole.
+      this.props?.place('gravel', p.x + rng.jitter(0.6), y0, p.z + rng.jitter(0.6), rng.range(0, 6.28), 1.2);
+      this.props?.place('weed', p.x + rng.jitter(0.45), y0, p.z + rng.jitter(0.45), rng.range(0, 6.28), 1.1);
+    }
+
+    // Spans. Doubled wires where the run is long, because one lonely wire reads
+    // as a mistake and three read as a street.
+    const spans: Array<[number, number, number, number, number, number, number]> = [
+      // x0, y0, z0, x1, y1, z1, sag
+      [8.7, 7.95, -6.6, -6.95, 6.9, -4.6, 0.95],
+      [8.7, 8.2, -6.6, 10.4, 8.85, -24.6, 1.35],
+      [10.4, 8.6, -24.6, 16.1, 8.2, -27.5, 0.55],
+      [10.4, 8.05, -24.6, 6.6, 9.6, -34.2, 0.8],
+      [7.85, 7.5, 12.2, -8.9, 7.1, 4.4, 1.25],
+      [-8.9, 7.05, 4.4, -10.5, 6.5, 9.0, 0.4],
+      [7.85, 7.2, 12.2, 9.45, 6.6, 19.4, 0.5],
+      [8.7, 7.4, -6.6, 7.85, 7.6, 12.2, 1.5],
+    ];
+    const wires = new GeoBuilder();
+    for (let i = 0; i < spans.length; i++) {
+      const [ax, ay, az, bx, by, bz, sag] = spans[i];
+      const n = Math.hypot(bx - ax, bz - az) > 17 ? 2 : 1;
+      for (let k = 0; k < n; k++) {
+        const off = (k - (n - 1) * 0.5) * 0.3;
+        wires.add(
+          cableGeo(
+            new THREE.Vector3(ax, ay - k * 0.34, az + off),
+            new THREE.Vector3(bx, by - k * 0.34, bz + off),
+            sag * rng.range(0.85, 1.2),
+            0.021,
+            12,
+          ),
+        );
+      }
+    }
+    const wg = wires.build();
+    if (wg) this.add('east', 'metalRust', wg);
+  }
+
+  /**
+   * A collapsed slab stack leaning off the warehouse's west wall.
+   *
+   * The hero pose looks straight down the street and everything in it is
+   * vertical or horizontal. Two floor slabs that have come down and are leaning
+   * at 50-odd degrees put a diagonal into the frame, throw a long raking
+   * shadow across the paving, and give the eye a piece of readable damage at
+   * mid-distance — which is what the squint test is asking for.
+   */
+  private collapsedSlabs(): void {
+    const rng = new Rng(0x51ab);
+    const wallX = 16.0;
+
+    // Stub of the collapsed bay, broken off at head height.
+    let x = wallX - 4.6;
+    while (x < wallX - 0.4) {
+      const w = Math.min(wallX - 0.4 - x, rng.range(0.6, 1.5));
+      const h = rng.range(1.1, 3.4);
+      const g = bevelBox(w * 1.05, h, 0.44, 0.026);
+      this.add('east', 'concrete', g, matrixOf(x + w * 0.5, h * 0.5, -12.4, rng.jitter(0.03)));
+      this.collider.addBox('concrete', { cx: x + w * 0.5, cy: h * 0.5, cz: -12.4, sx: w, sy: h, sz: 0.44 });
+      if (rng.chance(0.5)) {
+        const p = spallPatch(rng.range(0.4, 0.9), rng.range(0.4, 0.9), 0.022, 0x51ab + x * 7);
+        this.add('east', 'brick', p, matrixOf(x + w * 0.5, h * 0.6, -12.63, 0));
+      }
+      if (rng.chance(0.45)) this.props?.place('rebar_tuft', x + w * 0.5, h - 0.1, -12.4, rng.range(0, 6.28), rng.range(0.8, 1.5));
+      x += w;
+    }
+
+    // Two slabs off the same floor plate, leaning at different angles so they
+    // read as having fallen rather than been placed.
+    for (const [sx, sz, tilt, len, wide, yaw] of [
+      [13.6, -15.2, 0.92, 6.4, 3.6, 0.18],
+      [14.6, -18.4, 1.16, 5.2, 2.8, -0.26],
+    ] as const) {
+      const slab = bevelBox(wide, 0.28, len, 0.03);
+      const m = matrixOf(sx, Math.sin(tilt) * len * 0.5 + 0.2, sz, yaw, tilt, 0);
+      this.add('east', 'concrete', slab, m);
+      this.solid('concrete', [{ cx: 0, cy: 0, cz: 0, sx: wide, sy: 0.28, sz: len }], m);
+      // Rebar fringing the broken edge, sagging out of the underside.
+      for (let i = 0; i < 3; i++) {
+        const u = (i - 1) * wide * 0.26;
+        this.props?.place(
+          'rebar_tuft',
+          sx + Math.cos(yaw) * u + Math.sin(yaw) * Math.cos(tilt) * len * 0.48,
+          0.12 + Math.sin(tilt) * len * 0.02,
+          sz - Math.sin(yaw) * u + Math.cos(yaw) * Math.cos(tilt) * len * 0.48,
+          rng.range(0, 6.28),
+          rng.range(0.6, 0.95),
+        );
+      }
+    }
+
+    // Everything that came down with them, spilling out into the square.
+    this.debrisCone('east', 14.2, 0.02, -15.6, 3.2, 1.05, 0x51b1, -1, 0.25);
+    this.debrisCone('east', 15.0, 0.02, -19.6, 2.2, 0.7, 0x51b2, -1, -0.4);
+    for (let i = 0; i < 5; i++) {
+      this.props?.placeSolid(this.collider, rng.chance(0.5) ? 'rubble_chunk' : 'barrel', rng.range(12.6, 15.4), 0.02, rng.range(-20.5, -13.0), rng.range(0, 3.14));
     }
   }
 
@@ -1956,20 +2694,61 @@ export class LevelSystem implements System {
       new THREE.Box3(new THREE.Vector3(-60, -2, -60), new THREE.Vector3(60, 30, 60)),
       0.6,
     );
-    for (const b of this.collider.boxes) baker.addBox(b.center, b.half);
+    // Contact occlusion is baked separately and in 2D. The voxel baker cannot
+    // resolve it — a wall's base and the road it stands on land in the same
+    // 0.6m cell and get thrown away as self-occlusion, which is exactly why
+    // nothing in this map looked like it was touching the ground.
+    const contact = new ContactField(
+      new THREE.Box3(new THREE.Vector3(-58, 0, -58), new THREE.Vector3(58, 0, 58)),
+      0.35,
+    );
+    for (const b of this.collider.boxes) {
+      baker.addBox(b.center, b.half);
+      contact.addOccluder(b.center, b.half);
+    }
+    contact.finalize();
 
     for (const bucket of this.buckets.values()) {
       const geo = bucket.builder.build();
       if (!geo) continue;
       const def = surfaceDef(bucket.mat);
+      const glass = def.look === 'glass_dirty';
 
       baker.shade(geo, {
-        strength: def.look === 'glass_dirty' ? 0.2 : 0.74,
+        strength: glass ? 0.2 : 0.74,
         groundHeight: 0.7,
-        groundStrength: def.look === 'glass_dirty' ? 0.12 : 0.46,
+        groundStrength: glass ? 0.12 : 0.46,
         dirtColor: 0x6b5c46,
         seed: (def.seed ?? 1) * 7,
       });
+      contact.shade(geo, {
+        ground: glass ? 0.1 : bucket.mat === 'interiorDark' ? 0.15 : 0.56,
+        overhead: glass ? 0.08 : 0.36,
+        soffit: glass ? 0.06 : 0.32,
+        tint: 0x3a3128,
+        max: 0.82,
+      });
+
+      // Soot. Applied after the occlusion terms so a blast reads as burnt
+      // rather than merely shaded.
+      if (!glass) {
+        geo.computeBoundingBox();
+        const bb = geo.boundingBox;
+        for (const sc of this.scorch) {
+          if (bb && (
+            sc.p.x + sc.r < bb.min.x || sc.p.x - sc.r > bb.max.x ||
+            sc.p.y + sc.r < bb.min.y || sc.p.y - sc.r > bb.max.y ||
+            sc.p.z + sc.r < bb.min.z || sc.p.z - sc.r > bb.max.z
+          )) continue;
+          paintSphere(geo, sc.p, sc.r, 0x2c2620, sc.s, 2.1);
+        }
+      }
+
+      // Aerial perspective on the standing geometry. The perimeter ring and the
+      // end blocks are 40-55m out; without a chroma lift they render at the
+      // same contrast as the wall two metres from the muzzle and the frame has
+      // no depth in it at all.
+      paintAerial(geo, 0, 0, 20, 92, 0x9fb2c6, 0.42);
 
       if (!vault.triplanarEnabled) worldPlanarUv(geo, def.tiles);
       geo.computeBoundingSphere();
@@ -1990,7 +2769,17 @@ export class LevelSystem implements System {
       mesh.name = `level:${bucket.key}`;
       // Glass and the unlit fake rooms behind window holes are pure cost in the
       // shadow pass and contribute nothing to it.
-      mesh.castShadow = def.look !== 'glass_dirty' && bucket.mat !== 'interiorDark';
+      // Ground planes are the lowest thing in the map and the distant massing
+      // is outside every cascade that matters; neither can cast a shadow onto
+      // anything, and both are large. Keeping them out of the depth passes is
+      // free performance with no visible consequence.
+      const zone = bucket.key.slice(0, bucket.key.indexOf('/'));
+      const isFloor = bucket.mat === 'sand' || bucket.mat === 'road' || bucket.mat === 'dirt';
+      mesh.castShadow =
+        def.look !== 'glass_dirty' &&
+        bucket.mat !== 'interiorDark' &&
+        !isFloor &&
+        zone !== 'perimeter';
       mesh.receiveShadow = true;
       mesh.matrixAutoUpdate = false;
       mesh.updateMatrix();

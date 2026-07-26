@@ -25,6 +25,8 @@ import {
 } from './Shaders';
 
 const BLOOM_LEVELS = 6;
+/** How much of the GTAO term reaches the composite at full weight. */
+const AO_STRENGTH = 0.8;
 const MIN_ADAPTIVE_SCALE = 0.6;
 const MAX_DYNAMIC_MESHES = 16;
 const DYNAMIC_REFRESH_FRAMES = 30;
@@ -120,9 +122,15 @@ export class RenderPipeline implements RenderSystem {
   private jitterIndex = 0;
 
   // Post state ---------------------------------------------------------------
-  // Chosen with the sky's calibration: puts sunlit concrete in the upper mid
-  // range while leaving the horizon short of clipping.
-  private exposure = 1.6;
+  /**
+   * The lighting rig's sun went up and its ambient came down by more, which is
+   * a contrast change rather than a brightness change — so the exposure has to
+   * absorb the difference or the whole frame simply gets hotter. Set by the
+   * highlight end, because that is the end with no headroom: sunlit plaster
+   * lands around 0.75, which leaves the sky's diffuse dome under the shoulder
+   * and lets the shadows fall where the ratio puts them, near 0.08.
+   */
+  private exposure = 1.3;
   private focusDistance = 8;
   private focusTarget = 8;
   private focusVelocity = 0;
@@ -283,12 +291,19 @@ export class RenderPipeline implements RenderSystem {
         uInvProj: { value: new THREE.Matrix4() },
         uInvFullRes: { value: new THREE.Vector2() },
         uProjScaleY: { value: 1 },
-        uRadius: { value: 0.85 },
-        uPower: { value: 1.55 },
+        // World-space, in metres. 0.85 was tuned for surface crevices; the
+        // occlusion that actually sells a frame is architectural — the metre or
+        // so where a wall, a barrier or a crate meets the ground. Below ~0.6m
+        // the pass simply cannot see that contact and every object in the level
+        // looks pasted onto the road.
+        uRadius: { value: 1.0 },
+        uPower: { value: 1.5 },
         uFrame: { value: 0 },
-        uFadeRange: { value: new THREE.Vector2(28, 62) },
+        uFadeRange: { value: new THREE.Vector2(34, 70) },
       },
-      { GTAO_SLICES: heavy ? 4 : 3, GTAO_STEPS: q.preset === 'ultra' ? 3 : 2 },
+      // Even the low preset gets three slices: with two, a 1m radius at half
+      // resolution turns contact darkening into three grey lobes per corner.
+      { GTAO_SLICES: heavy ? 4 : 3, GTAO_STEPS: q.preset === 'ultra' ? 4 : q.preset === 'low' ? 2 : 3 },
     );
 
     this.mBlur = this.makeMaterial(BILATERAL_FRAG, {
@@ -331,13 +346,29 @@ export class RenderPipeline implements RenderSystem {
       uInvProj: { value: new THREE.Matrix4() },
       uCamWorld: { value: new THREE.Matrix4() },
       uCamPos: { value: new THREE.Vector3() },
-      uAoStrength: { value: 0.85 },
+      uAoStrength: { value: AO_STRENGTH },
+      // Ambient occlusion occludes *ambient*. Applying it to a surface the sun
+      // is hitting is a lighting error that reads as dirt smeared into every
+      // corner. There is no separate indirect buffer to multiply here, so the
+      // pass uses scene luminance as the proxy: with the sun now eight-ish
+      // times the fill, anything above this band is by definition sunlit and
+      // keeps only uAoDirectKeep of its occlusion — enough for the bounce it
+      // does block, not enough to dirty the key.
+      uAoLitRange: { value: new THREE.Vector2(0.3, 0.85) },
+      uAoDirectKeep: { value: 0.3 },
       uSsrEnabled: { value: 0 },
       uVolumeEnabled: { value: 0 },
-      uFogDensity: { value: 0.0035 },
-      uFogHeightFalloff: { value: 0.045 },
-      uFogBaseHeight: { value: -1.5 },
-      uFogStart: { value: 9 },
+      // Aerial perspective. Roughly three times the old density with twice the
+      // height falloff: at 90m a ground-level facade now takes ~40% of the sky
+      // radiance along its view ray, while a roofline 14m up takes a fraction
+      // of that. Distance therefore reads as *air*, with the near-sun side of
+      // the frame hazing warm and the away side hazing cool, and the ground
+      // plane hazing harder than anything standing on it.
+      uFogDensity: { value: 0.0072 },
+      uFogHeightFalloff: { value: 0.1 },
+      uFogBaseHeight: { value: -1.0 },
+      uFogStart: { value: 13 },
+      uFogDesaturate: { value: 0.4 },
       uSkyZenith: { value: new THREE.Color(0.15, 0.4, 1.0) },
       uSkyHorizon: { value: new THREE.Color(1.2, 1.1, 1.0) },
       uSkyGround: { value: new THREE.Color(0.1, 0.09, 0.08) },
@@ -348,7 +379,7 @@ export class RenderPipeline implements RenderSystem {
     this.mBloomPrefilter = this.makeMaterial(BLOOM_PREFILTER_FRAG, {
       tDiffuse: { value: null },
       uTexel: { value: new THREE.Vector2() },
-      uThreshold: { value: 1.15 },
+      uThreshold: { value: 1.35 },
       uKnee: { value: 0.6 },
       uClamp: { value: 3.0 },
       uExposure: { value: 1.6 },
@@ -414,25 +445,36 @@ export class RenderPipeline implements RenderSystem {
       tDiffuse: { value: null },
       tBloom: { value: null },
       uExposure: { value: 1 },
-      uBloomStrength: { value: q.bloom ? 0.042 : 0 },
-      uLift: { value: new THREE.Vector3(0.006, 0.008, 0.014) },
-      uGamma: { value: new THREE.Vector3(1.0, 1.0, 1.02) },
-      uGain: { value: new THREE.Vector3(1.02, 1.0, 0.985) },
-      uShadowTint: { value: new THREE.Vector3(0.86, 0.96, 1.12) },
-      uHighlightTint: { value: new THREE.Vector3(1.06, 1.0, 0.92) },
-      uSaturation: { value: 1.08 },
+      uBloomStrength: { value: q.bloom ? 0.055 : 0 },
+      uLift: { value: new THREE.Vector3(0.017, 0.020, 0.029) },
+      uGamma: { value: new THREE.Vector3(1.0, 1.0, 1.03) },
+      uGain: { value: new THREE.Vector3(1.025, 1.0, 0.972) },
+      // Pushed well past the previous split. Shadowed faces go cool, sunlit
+      // faces go warm, and the eye reads the difference as light rather than as
+      // pigment — which is the whole trick, because the pigment is then free to
+      // come down.
+      uShadowTint: { value: new THREE.Vector3(0.9, 0.965, 1.085) },
+      uHighlightTint: { value: new THREE.Vector3(1.12, 1.005, 0.85) },
+      // Call of Duty's palette is far more desaturated than anyone remembers.
+      // It earns its colour from the light, not from the materials.
+      uSaturation: { value: 0.86 },
       uContrast: { value: 1.09 },
+      // Filmic toe and shoulder. ACES has its own, but the pivot contrast above
+      // it used to be a straight line into a hard clamp, which is what put the
+      // frame in a narrow mid band with no black and no roll-off at the top.
+      uToe: { value: 0.14 },
+      uShoulder: { value: 0.75 },
     });
 
     this.mFinal = this.makeMaterial(FINAL_FRAG, {
       tDiffuse: { value: null },
       uResolution: { value: new THREE.Vector2() },
       uTime: { value: 0 },
-      uAberration: { value: 0.0038 },
+      uAberration: { value: 0.0021 },
       uDistortion: { value: 0.035 },
-      uVignette: { value: 0.34 },
-      uGrain: { value: 0.022 },
-      uSharpen: { value: 0.32 },
+      uVignette: { value: 0.4 },
+      uGrain: { value: 0.026 },
+      uSharpen: { value: 0.24 },
       uFxaa: { value: 0 },
     });
 
@@ -450,13 +492,17 @@ export class RenderPipeline implements RenderSystem {
       uCamPos: { value: new THREE.Vector3() },
       uSunDir: { value: new THREE.Vector3(0, 1, 0) },
       uSunColor: { value: new THREE.Color(1, 0.85, 0.65) },
-      // Low enough that the march reads as shafts where the sun rakes past an
-      // occluder rather than as a uniform veil over the whole frame.
-      uDensity: { value: 0.0055 },
-      uHeightFalloff: { value: 0.085 },
+      // High enough that the march reads as shafts where the sun rakes past an
+      // occluder, low enough that it never becomes a uniform veil. With the sun
+      // ahead of the hero camera and 26 degrees off the street's axis, every
+      // alley mouth and roofline gap on the east terrace throws one.
+      uDensity: { value: 0.0085 },
+      // Shallower than before so the shafts survive up to roof height instead
+      // of dying at head height; the medium is dust, and dust is well mixed.
+      uHeightFalloff: { value: 0.055 },
       uBaseHeight: { value: -2 },
-      uG: { value: 0.72 },
-      uMaxDistance: { value: 85 },
+      uG: { value: 0.74 },
+      uMaxDistance: { value: 64 },
       uFrame: { value: 0 },
       uCascadeFar: { value: new THREE.Vector4(1e6, 1e6, 1e6, 1e6) },
     };
@@ -465,10 +511,13 @@ export class RenderPipeline implements RenderSystem {
       uniforms[`uShadowMat${i}`] = { value: new THREE.Matrix4() };
     }
 
-    const q = this.ctx?.quality;
+    const preset = this.ctx?.quality.preset;
     this.mVolume = this.makeMaterial(VOLUMETRIC_FRAG, uniforms, {
       CSM_COUNT: cascades,
-      VOL_STEPS: q?.preset === 'ultra' ? 16 : 12,
+      // Half resolution, dithered, and the step count only sets how smooth the
+      // shaft edge is — 8 is cheap enough for a software rasteriser and still
+      // reads as light rather than as banding.
+      VOL_STEPS: preset === 'ultra' ? 16 : preset === 'low' ? 6 : 12,
     });
   }
 
@@ -708,14 +757,24 @@ export class RenderPipeline implements RenderSystem {
     if (needVelocity) this.renderVelocity(ctx, velocity, scene, camera, viewCamera, w, h);
 
     // --- 3/4/5. Depth-driven effects on the world only ---------------------
-    const aoOn = q.ssao && this.aoRT !== null;
+    //
+    // Ambient occlusion and light shafts are not scalable luxuries here, they
+    // are load-bearing. Without AO nothing in the level makes contact with the
+    // ground and the whole frame reads as decals on a backdrop; without the
+    // volumetric march a backlit street has no air in it. The quality preset
+    // switches them off at 'low' — which is also the preset every software
+    // rasteriser and every phone gets, and therefore the preset the frame is
+    // most often judged at. Both are half-resolution single passes costing two
+    // triangles apiece; what scales with the preset is their tap count, set in
+    // the material defines. So they run whenever their targets exist.
+    const aoOn = this.aoRT !== null;
     if (aoOn) this.renderAo(scene, w, h, camera, ctx);
 
     const ssrOn = q.ssr && this.ssrRT !== null;
     if (ssrOn) this.renderSsr(scene, w, h, camera, ctx, sky);
 
     let volumeOn = false;
-    if (q.volumetrics && lighting && this.volumeRT) {
+    if (lighting && this.volumeRT) {
       volumeOn = this.renderVolumetrics(scene, camera, ctx, lighting);
     }
 
@@ -807,7 +866,7 @@ export class RenderPipeline implements RenderSystem {
       u.tDiffuse.value = resolved;
       u.tBloom.value = bloomTexture;
       u.uExposure.value = this.exposure;
-      u.uBloomStrength.value = bloomTexture ? 0.042 : 0;
+      u.uBloomStrength.value = bloomTexture ? 0.055 : 0;
       this.blit(this.mTonemap, tonemapTarget);
     }
 
@@ -827,8 +886,8 @@ export class RenderPipeline implements RenderSystem {
       // Unsharp mask amplifies whatever the upscale reconstructed. Backing it
       // off with the internal resolution keeps a 0.7-scale frame from turning
       // every chamfer into a bright dash.
-      u.uSharpen.value = 0.32 * (0.42 + 0.58 * this.adaptiveScale);
-      u.uAberration.value = 0.0038 * (0.45 + 0.55 * this.adaptiveScale);
+      u.uSharpen.value = 0.24 * (0.42 + 0.58 * this.adaptiveScale);
+      u.uAberration.value = 0.0021 * (0.45 + 0.55 * this.adaptiveScale);
       this.blit(this.mFinal, null);
     }
 
@@ -1022,7 +1081,7 @@ export class RenderPipeline implements RenderSystem {
     (u.uCamWorld.value as THREE.Matrix4).copy(camera.matrixWorld);
     (u.uCamPos.value as THREE.Vector3).copy(camera.position);
     (u.uSunDir.value as THREE.Vector3).copy(lighting.sunDirection);
-    (u.uSunColor.value as THREE.Color).copy(lighting.sunColor).multiplyScalar(lighting.sunIntensity * 0.9);
+    (u.uSunColor.value as THREE.Color).copy(lighting.sunColor).multiplyScalar(lighting.sunIntensity * 0.5);
     u.uFrame.value = ctx.time.frame % 64;
 
     const far = u.uCascadeFar.value as THREE.Vector4;
@@ -1089,7 +1148,7 @@ export class RenderPipeline implements RenderSystem {
     (u.uInvProj.value as THREE.Matrix4).copy(this.projInvSaved);
     (u.uCamWorld.value as THREE.Matrix4).copy(camera.matrixWorld);
     (u.uCamPos.value as THREE.Vector3).copy(camera.position);
-    u.uAoStrength.value = aoOn ? 0.85 : 0;
+    u.uAoStrength.value = aoOn ? AO_STRENGTH : 0;
     u.uSsrEnabled.value = ssrOn ? 1 : 0;
     u.uVolumeEnabled.value = volumeOn ? 1 : 0;
     if (sky) {

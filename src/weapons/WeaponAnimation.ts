@@ -435,7 +435,7 @@ const _tmpQ = new THREE.Quaternion();
 const _tmpQ2 = new THREE.Quaternion();
 const _tmpE = new THREE.Euler(0, 0, 0, 'XYZ');
 /** Metres the hip pose is pushed down the bore, away from the eye. */
-const HIP_DEPTH_PUSH = 0.185;
+const HIP_DEPTH_PUSH = 0.225;
 /** The lateral/vertical hold widens a little to match the extra depth. */
 const HIP_LATERAL_SCALE = 1.18;
 

@@ -171,6 +171,67 @@ export function tintGeometry(geo: THREE.BufferGeometry, color: THREE.ColorRepres
 }
 
 /**
+ * Aerial perspective, baked in. Vertices lift toward `color` (the sky at the
+ * horizon) with horizontal distance from `x,z`, which is what stops a building
+ * 180m out reading at the same contrast and saturation as the one 12m out.
+ * Fog does part of this job in the pipeline; doing the albedo lift here as well
+ * is what makes the far massing sit *behind* the near massing rather than
+ * merely being tinted by something in front of it.
+ */
+export function paintAerial(
+  geo: THREE.BufferGeometry,
+  x: number,
+  z: number,
+  near: number,
+  far: number,
+  color: THREE.ColorRepresentation,
+  maxStrength = 0.75,
+): void {
+  _col.set(color);
+  const pos = geo.getAttribute('position') as THREE.BufferAttribute;
+  const c = geo.getAttribute('color') as THREE.BufferAttribute;
+  const span = Math.max(1e-3, far - near);
+  for (let i = 0; i < pos.count; i++) {
+    const dx = pos.getX(i) - x;
+    const dz = pos.getZ(i) - z;
+    const t = Math.min(1, Math.max(0, (Math.hypot(dx, dz) - near) / span));
+    const k = t * t * (3 - 2 * t) * maxStrength;
+    if (k <= 0.001) continue;
+    c.setXYZ(
+      i,
+      c.getX(i) * (1 - k) + _col.r * k,
+      c.getY(i) * (1 - k) + _col.g * k,
+      c.getZ(i) * (1 - k) + _col.b * k,
+    );
+  }
+  c.needsUpdate = true;
+}
+
+/**
+ * Slack cable between two points. A real catenary, not a straight line: the sag
+ * is what makes a wire read as a wire, and a run of them across a street is the
+ * cheapest strong silhouette element there is against a bright sky.
+ */
+export function cableGeo(
+  from: THREE.Vector3,
+  to: THREE.Vector3,
+  sag: number,
+  radius = 0.018,
+  segments = 10,
+): THREE.BufferGeometry {
+  const pts: THREE.Vector3[] = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = i / segments;
+    const p = from.clone().lerp(to, t);
+    // cosh-shaped droop, normalised so the ends stay pinned.
+    p.y -= sag * (Math.cosh((t - 0.5) * 3.2) - Math.cosh(1.6)) / (1 - Math.cosh(1.6));
+    pts.push(p);
+  }
+  const curve = new THREE.CatmullRomCurve3(pts);
+  return finalizeGeometry(new THREE.TubeGeometry(curve, segments, radius, 4, false));
+}
+
+/**
  * Multiplies vertex colour toward `color` inside a sphere with a smooth falloff.
  * Used for scorch haloes around breaches and grime pooling in corners.
  */
@@ -549,6 +610,12 @@ export interface Opening {
   y: number;
   w: number;
   h: number;
+  /**
+   * Suppresses the sill and lintel. A shell hole is not joinery: it has no
+   * head, no cill and no reveal, and dressing one with moulded stone is the
+   * fastest way to make damage read as architecture.
+   */
+  raw?: boolean;
 }
 
 export interface WallResult {
@@ -639,12 +706,33 @@ function effRect(o: Opening, shrink: number): { x0: number; x1: number; y0: numb
   };
 }
 
+/**
+ * One solid cell of a slab, plus how far each of its four sides may be grown.
+ *
+ * Growth is the seam fix. Two abutting chamfered panels meet in a V-groove whose
+ * facets catch the key light and alias into a bright dashed hairline — the
+ * single most engine-looking artefact on a facade. Growing each panel across an
+ * edge it *shares with another solid panel* by one chamfer width buries both
+ * chamfers behind the neighbour's flat face, so the two front faces meet
+ * exactly, coplanar, with no groove and no overlap to z-fight. Sides that face
+ * an opening, or the outside of the wall, are left alone: those are genuine
+ * outside corners and the chamfer is what makes them read.
+ */
+interface SlabCell {
+  rect: CellRect;
+  xs: number[];
+  ys: number[];
+  /** Metres of growth on -x, +x, -y, +y. */
+  grow: [number, number, number, number];
+}
+
 function slabRects(
   width: number,
   height: number,
   openings: readonly Opening[],
   shrink: number,
-): { rect: CellRect; xs: number[]; ys: number[] }[] {
+  weld = 0,
+): SlabCell[] {
   const halfW = width * 0.5;
   const rects = openings.map((o) => effRect(o, shrink)).filter((r) => r.x1 > r.x0 && r.y1 > r.y0);
   const xCuts: number[] = [];
@@ -672,7 +760,20 @@ function slabRects(
       solid[y * nx + x] = open ? 0 : 1;
     }
   }
-  return coverRects(solid, nx, ny).map((rect) => ({ rect, xs, ys }));
+  return coverRects(solid, nx, ny).map((rect) => {
+    const grow: [number, number, number, number] = [0, 0, 0, 0];
+    if (weld > 0) {
+      for (let y = rect.y0; y < rect.y1; y++) {
+        if (rect.x0 > 0 && solid[y * nx + rect.x0 - 1]) grow[0] = weld;
+        if (rect.x1 < nx && solid[y * nx + rect.x1]) grow[1] = weld;
+      }
+      for (let x = rect.x0; x < rect.x1; x++) {
+        if (rect.y0 > 0 && solid[(rect.y0 - 1) * nx + x]) grow[2] = weld;
+        if (rect.y1 < ny && solid[rect.y1 * nx + x]) grow[3] = weld;
+      }
+    }
+    return { rect, xs, ys, grow };
+  });
 }
 
 /**
@@ -703,17 +804,18 @@ export function wallWithOpenings(
   const parts: THREE.BufferGeometry[] = [];
   const boxes: BoxSpec[] = [];
 
-  const emit = (
-    cells: { rect: CellRect; xs: number[]; ys: number[] }[],
-    z0: number,
-    z1: number,
-    collide: boolean,
-  ): void => {
-    for (const { rect, xs, ys } of cells) {
-      const x0 = xs[rect.x0];
-      const x1 = xs[rect.x1];
-      const y0 = ys[rect.y0];
-      const y1 = ys[rect.y1];
+  const emit = (cells: SlabCell[], z0: number, z1: number, collide: boolean): void => {
+    for (const { rect, xs, ys, grow } of cells) {
+      const cx0 = xs[rect.x0];
+      const cx1 = xs[rect.x1];
+      const cy0 = ys[rect.y0];
+      const cy1 = ys[rect.y1];
+      // Grown extents for the visual box; the collision box stays on the true
+      // cell so a 2cm weld never shows up as a lip under the player capsule.
+      const x0 = cx0 - grow[0];
+      const x1 = cx1 + grow[1];
+      const y0 = cy0 - grow[2];
+      const y1 = cy1 + grow[3];
       const w = x1 - x0;
       const h = y1 - y0;
       const d = z1 - z0;
@@ -722,18 +824,29 @@ export function wallWithOpenings(
       g.translate((x0 + x1) * 0.5, (y0 + y1) * 0.5, (z0 + z1) * 0.5);
       parts.push(g);
       if (collide) {
-        boxes.push({ cx: (x0 + x1) * 0.5, cy: (y0 + y1) * 0.5, cz: 0, sx: w, sy: h, sz: thickness });
+        boxes.push({
+          cx: (cx0 + cx1) * 0.5,
+          cy: (cy0 + cy1) * 0.5,
+          cz: 0,
+          sx: cx1 - cx0,
+          sy: cy1 - cy0,
+          sz: thickness,
+        });
       }
     }
   };
 
+  // One chamfer width of overlap: the neighbour's flat face starts exactly
+  // where this panel's chamfer does, so the chamfer is occluded and the two
+  // front planes abut without overlapping.
+  const weld = bevel;
   const halfT = thickness * 0.5;
   if (twoLeaf) {
     const outerT = thickness * 0.56;
-    emit(slabRects(width, height, openings, 0), halfT - outerT, halfT, false);
-    emit(slabRects(width, height, openings, reveal), -halfT, halfT - outerT, true);
+    emit(slabRects(width, height, openings, 0, weld), halfT - outerT, halfT, false);
+    emit(slabRects(width, height, openings, reveal, weld), -halfT, halfT - outerT, true);
   } else {
-    emit(slabRects(width, height, openings, 0), -halfT, halfT, true);
+    emit(slabRects(width, height, openings, 0, weld), -halfT, halfT, true);
   }
 
   // Plinth.
@@ -765,12 +878,16 @@ export function wallWithOpenings(
 
   // Sills and lintels.
   for (const o of openings) {
+    if (o.raw) continue;
     if (opts.sills !== false && o.y > 0.35) {
-      const s = extrudeProfile(sillProfile(0.15, 0.085), o.w + 0.22, { bevel: 0.008 });
+      // A sill that projects properly is a horizontal shadow line across the
+      // elevation and the anchor for the runoff stain below it. 15cm was not
+      // enough to throw one.
+      const s = extrudeProfile(sillProfile(0.2, 0.1), o.w + 0.3, { bevel: 0.008 });
       s.rotateY(-Math.PI * 0.5);
       s.translate(o.x, o.y + 0.005, halfT);
       parts.push(s);
-      boxes.push({ cx: o.x, cy: o.y - 0.04, cz: halfT * 0.5, sx: o.w + 0.22, sy: 0.09, sz: thickness });
+      boxes.push({ cx: o.x, cy: o.y - 0.05, cz: halfT * 0.5, sx: o.w + 0.3, sy: 0.1, sz: thickness });
     }
     if (opts.lintels !== false) {
       const l = bevelBox(o.w + 0.3, 0.15, thickness + 0.07, 0.018);
@@ -1090,9 +1207,12 @@ export function windowFrameGeo(width: number, height: number, depth = 0.07): THR
     g.translate(x, y, 0);
     parts.push(g);
   }
-  const mullion = bevelBox(0.038, height - t * 2, depth * 0.82, 0.006);
+  // Mullion and transom are 3.8cm members read at a couple of pixels through a
+  // dirty pane; the chamfer on them is not resolvable and they are the single
+  // most repeated pair of boxes on the map.
+  const mullion = plainBox(0.038, height - t * 2, depth * 0.82);
   parts.push(mullion);
-  const transom = bevelBox(width - t * 2, 0.036, depth * 0.82, 0.006);
+  const transom = plainBox(width - t * 2, 0.036, depth * 0.82);
   transom.translate(0, height * 0.18, 0);
   parts.push(transom);
 
@@ -1103,15 +1223,23 @@ export function windowFrameGeo(width: number, height: number, depth = 0.07): THR
 export function shutterGeo(width: number, height: number, slats = 6): THREE.BufferGeometry {
   const parts: THREE.BufferGeometry[] = [];
   const styleW = 0.055;
-  const frame: [number, number, number, number][] = [
+  // Stiles keep their chamfer: they are the vertical members the low sun rakes
+  // across and the ones you read the shutter's thickness from. The two rails
+  // are horizontal, always in the stile's own shadow, and there are two of them
+  // on every leaf of every shutter on the map — much the cheapest place to
+  // spend a hundred thousand triangles is not there.
+  const stiles: [number, number, number, number][] = [
     [-width * 0.5 + styleW * 0.5, 0, styleW, height],
     [width * 0.5 - styleW * 0.5, 0, styleW, height],
-    [0, height * 0.5 - styleW * 0.5, width - styleW * 2, styleW],
-    [0, -height * 0.5 + styleW * 0.5, width - styleW * 2, styleW],
   ];
-  for (const [x, y, w, h] of frame) {
+  for (const [x, y, w, h] of stiles) {
     const g = bevelBox(w, h, 0.034, 0.005);
     g.translate(x, y, 0);
+    parts.push(g);
+  }
+  for (const y of [height * 0.5 - styleW * 0.5, -height * 0.5 + styleW * 0.5]) {
+    const g = plainBox(width - styleW * 2, styleW, 0.034);
+    g.translate(0, y, 0);
     parts.push(g);
   }
   const inner = height - styleW * 2.4;
@@ -1185,21 +1313,65 @@ export function greebleFace(
  * the pile, so the silhouette is a real talus slope rather than a heap of
  * floating cubes.
  */
+export interface RubbleOpts {
+  bevelScale?: number;
+  /**
+   * Direction the blast travelled, in the cone's local XZ. When set, the pile
+   * stops being a neat radial heap: mass is thrown downrange, the throw fans
+   * out and thins with distance, and the pieces closest to the blast point are
+   * the largest. This is the difference between "debris" and "a tidy pile of
+   * debris someone swept up".
+   */
+  throwX?: number;
+  throwZ?: number;
+  /** How far downrange the throw reaches, as a multiple of `radius`. */
+  reach?: number;
+  /** Half-angle of the fan, radians. */
+  spread?: number;
+}
+
 export function rubbleCone(
   radius: number,
   height: number,
   count: number,
   seed: number,
-  bevelScale = 0.14,
+  opts: RubbleOpts | number = {},
 ): THREE.BufferGeometry {
+  const o: RubbleOpts = typeof opts === 'number' ? { bevelScale: opts } : opts;
+  const bevelScale = o.bevelScale ?? 0.14;
+  const tx = o.throwX ?? 0;
+  const tz = o.throwZ ?? 0;
+  const throwLen = Math.hypot(tx, tz);
+  const dirA = throwLen > 1e-4 ? Math.atan2(tz, tx) : 0;
+  const reach = (o.reach ?? 2.6) * radius;
+  const spread = o.spread ?? 0.85;
+
   const rng = new Rng(seed);
   const parts: THREE.BufferGeometry[] = [];
   for (let i = 0; i < count; i++) {
-    // sqrt for uniform area density, then biased inward so the peak is dense.
-    const r = radius * Math.pow(rng.next(), 0.62);
-    const a = rng.range(0, Math.PI * 2);
+    let x: number;
+    let z: number;
+    let r: number;
+    let s: number;
+    if (throwLen > 1e-4 && rng.chance(0.62)) {
+      // Downrange throw: density falls as t^-1 and piece size with it, so the
+      // cone tapers instead of ending on a hard edge.
+      const t = Math.pow(rng.next(), 0.55);
+      const a = dirA + rng.jitter(spread) * (0.35 + t * 0.9);
+      const d = radius * 0.35 + t * reach;
+      x = Math.cos(a) * d;
+      z = Math.sin(a) * d;
+      r = d;
+      s = rng.range(0.07, 0.3) * (1 - t * 0.62);
+    } else {
+      // sqrt for uniform area density, then biased inward so the peak is dense.
+      r = radius * Math.pow(rng.next(), 0.62);
+      const a = rng.range(0, Math.PI * 2);
+      x = Math.cos(a) * r;
+      z = Math.sin(a) * r;
+      s = rng.range(0.09, 0.34) * (1 - (r / radius) * 0.35);
+    }
     const surface = height * Math.max(0, 1 - r / radius) * rng.range(0.55, 1.0);
-    const s = rng.range(0.09, 0.34) * (1 - (r / radius) * 0.35);
     const g =
       bevelScale > 0
         ? bevelBox(s * rng.range(0.7, 1.6), s * rng.range(0.5, 1.1), s * rng.range(0.7, 1.5), s * bevelScale)
@@ -1207,7 +1379,7 @@ export function rubbleCone(
     g.rotateY(rng.range(0, Math.PI * 2));
     g.rotateX(rng.jitter(0.7));
     g.rotateZ(rng.jitter(0.7));
-    g.translate(Math.cos(a) * r, surface + s * 0.2, Math.sin(a) * r);
+    g.translate(x, surface + s * 0.2, z);
     parts.push(g);
   }
   return finalizeGeometry(mergeAll(parts));
@@ -1644,6 +1816,209 @@ export class OcclusionBaker {
 
 function fract(x: number): number {
   return x - Math.floor(x);
+}
+
+// ---------------------------------------------------------------------------
+// Contact occlusion
+// ---------------------------------------------------------------------------
+
+export interface ContactOptions {
+  /** Peak darkening where a horizontal surface runs into something vertical. */
+  ground?: number;
+  /** Peak darkening on a horizontal surface that has something over it. */
+  overhead?: number;
+  /** Flat darkening on downward-facing surfaces: soffits, sills, slab undersides. */
+  soffit?: number;
+  /** Colour the occluded vertices are pulled toward. */
+  tint?: THREE.ColorRepresentation;
+  /** Hard ceiling on total darkening, so nothing crushes to black. */
+  max?: number;
+}
+
+/**
+ * The contact shadow, baked into vertex colour from the level's own collision
+ * volumes.
+ *
+ * `OcclusionBaker` samples a 3D hemisphere and is good at rooms and corners, but
+ * it is voxelised at 0.6m and a wall's base shares a cell with the road it
+ * stands on — the one place occlusion matters most is exactly the place a
+ * coarse grid throws away as self-occlusion. So this does it in 2D instead: a
+ * chamfer distance transform of every standing volume's footprint gives, for
+ * any point on the ground, the metres to the nearest thing sticking up out of
+ * it. A tight double-exponential off that distance is the dark line where a
+ * building meets the street, and it is the difference between geometry sitting
+ * in a scene and geometry pasted onto it.
+ *
+ * A second grid records the underside height of anything overhead, which is
+ * what darkens the floor of an arcade, the ground under a balcony, and the
+ * inside of every room.
+ */
+export class ContactField {
+  private readonly cell: number;
+  private readonly inv: number;
+  private readonly ox: number;
+  private readonly oz: number;
+  private readonly nx: number;
+  private readonly nz: number;
+  private readonly dist: Float32Array;
+  private readonly ceiling: Float32Array;
+
+  constructor(bounds: THREE.Box3, cell = 0.4) {
+    this.cell = cell;
+    this.inv = 1 / cell;
+    this.ox = bounds.min.x;
+    this.oz = bounds.min.z;
+    this.nx = Math.max(1, Math.ceil((bounds.max.x - bounds.min.x) * this.inv));
+    this.nz = Math.max(1, Math.ceil((bounds.max.z - bounds.min.z) * this.inv));
+    this.dist = new Float32Array(this.nx * this.nz).fill(1e9);
+    this.ceiling = new Float32Array(this.nx * this.nz).fill(1e9);
+  }
+
+  /**
+   * Classifies one collision volume. Ground slabs, floor plates and roof decks
+   * are all boxes too, and if they were treated as occluders the distance field
+   * would be zero everywhere; the height tests are what separate "stands on the
+   * ground" from "is the ground".
+   */
+  addOccluder(center: THREE.Vector3, half: THREE.Vector3): void {
+    const bottom = center.y - half.y;
+    const top = center.y + half.y;
+    const stands = top >= 0.55 && half.y * 2 >= 0.45 && bottom <= 1.4;
+    const overhead = bottom >= 1.8;
+    if (!stands && !overhead) return;
+
+    const x0 = Math.max(0, Math.floor((center.x - half.x - this.ox) * this.inv));
+    const x1 = Math.min(this.nx - 1, Math.floor((center.x + half.x - this.ox) * this.inv));
+    const z0 = Math.max(0, Math.floor((center.z - half.z - this.oz) * this.inv));
+    const z1 = Math.min(this.nz - 1, Math.floor((center.z + half.z - this.oz) * this.inv));
+    if (x1 < x0 || z1 < z0) return;
+
+    for (let z = z0; z <= z1; z++) {
+      const row = z * this.nx;
+      for (let x = x0; x <= x1; x++) {
+        if (stands) this.dist[row + x] = 0;
+        if (overhead && bottom < this.ceiling[row + x]) this.ceiling[row + x] = bottom;
+      }
+    }
+  }
+
+  /** Two-pass chamfer distance transform. Call once, after every occluder. */
+  finalize(): void {
+    const { nx, nz, dist, cell } = this;
+    const D = 1;
+    const Q = Math.SQRT2;
+    for (let z = 0; z < nz; z++) {
+      for (let x = 0; x < nx; x++) {
+        const i = z * nx + x;
+        let d = dist[i];
+        if (d === 0) continue;
+        if (x > 0) d = Math.min(d, dist[i - 1] + D);
+        if (z > 0) {
+          d = Math.min(d, dist[i - nx] + D);
+          if (x > 0) d = Math.min(d, dist[i - nx - 1] + Q);
+          if (x < nx - 1) d = Math.min(d, dist[i - nx + 1] + Q);
+        }
+        dist[i] = d;
+      }
+    }
+    for (let z = nz - 1; z >= 0; z--) {
+      for (let x = nx - 1; x >= 0; x--) {
+        const i = z * nx + x;
+        let d = dist[i];
+        if (d === 0) continue;
+        if (x < nx - 1) d = Math.min(d, dist[i + 1] + D);
+        if (z < nz - 1) {
+          d = Math.min(d, dist[i + nx] + D);
+          if (x < nx - 1) d = Math.min(d, dist[i + nx + 1] + Q);
+          if (x > 0) d = Math.min(d, dist[i + nx - 1] + Q);
+        }
+        dist[i] = d;
+      }
+    }
+    for (let i = 0; i < dist.length; i++) dist[i] = Math.min(dist[i] * cell, 40);
+  }
+
+  /** Bilinear metres-to-nearest-standing-volume. Clamped at the grid edge. */
+  distanceAt(x: number, z: number): number {
+    const fx = Math.min(this.nx - 1.001, Math.max(0, (x - this.ox) * this.inv - 0.5));
+    const fz = Math.min(this.nz - 1.001, Math.max(0, (z - this.oz) * this.inv - 0.5));
+    const ix = fx | 0;
+    const iz = fz | 0;
+    const tx = fx - ix;
+    const tz = fz - iz;
+    const r0 = iz * this.nx + ix;
+    const r1 = r0 + this.nx;
+    const a = this.dist[r0] * (1 - tx) + this.dist[r0 + 1] * tx;
+    const b = this.dist[r1] * (1 - tx) + this.dist[r1 + 1] * tx;
+    return a * (1 - tz) + b * tz;
+  }
+
+  /** Underside height of the nearest thing overhead, or 1e9 for open sky. */
+  ceilingAt(x: number, z: number): number {
+    const ix = Math.floor((x - this.ox) * this.inv);
+    const iz = Math.floor((z - this.oz) * this.inv);
+    if (ix < 0 || ix >= this.nx || iz < 0 || iz >= this.nz) return 1e9;
+    return this.ceiling[iz * this.nx + ix];
+  }
+
+  /**
+   * Multiplies world-space geometry's vertex colours by the contact term.
+   *
+   * Only horizontal and downward-facing surfaces are touched. Vertical faces are
+   * deliberately left alone: a wall panel is one box with vertices only at its
+   * top and bottom, so a per-vertex base term would spread a 40cm contact line
+   * across a whole storey. Walls get their height gradient in the shader, where
+   * it is evaluated per pixel.
+   */
+  shade(geo: THREE.BufferGeometry, opts: ContactOptions = {}): void {
+    const ground = opts.ground ?? 0.52;
+    const overhead = opts.overhead ?? 0.34;
+    const soffit = opts.soffit ?? 0.3;
+    const cap = opts.max ?? 0.8;
+    _col.set(opts.tint ?? 0x3b3229);
+
+    const pos = geo.getAttribute('position') as THREE.BufferAttribute;
+    const nor = geo.getAttribute('normal') as THREE.BufferAttribute;
+    const col = geo.getAttribute('color') as THREE.BufferAttribute;
+
+    for (let i = 0; i < pos.count; i++) {
+      const ny = nor.getY(i);
+      const up = ny > 0 ? ny : 0;
+      const down = ny < 0 ? -ny : 0;
+      if (up < 0.12 && down < 0.15) continue;
+
+      const px = pos.getX(i);
+      const py = pos.getY(i);
+      const pz = pos.getZ(i);
+      let k = 0;
+
+      if (up >= 0.12) {
+        const d = this.distanceAt(px, pz);
+        // Two lobes: a tight one that is the actual contact line, a wide one
+        // that is the ambient the wall steals from the ground beside it.
+        const c = 0.55 * Math.exp(-d * 2.6) + 0.45 * Math.exp(-d * 0.62);
+        k += up * ground * c;
+
+        const ceil = this.ceilingAt(px, pz);
+        const gap = ceil - py;
+        if (gap > 0.25 && gap < 60) {
+          const t = Math.min(1, Math.max(0, (gap - 0.5) / 5.0));
+          k += up * overhead * (1 - t * t * (3 - 2 * t));
+        }
+      }
+      if (down >= 0.15) k += down * soffit;
+
+      if (k <= 0.002) continue;
+      if (k > cap) k = cap;
+      col.setXYZ(
+        i,
+        col.getX(i) * (1 - k + k * _col.r),
+        col.getY(i) * (1 - k + k * _col.g),
+        col.getZ(i) * (1 - k + k * _col.b),
+      );
+    }
+    col.needsUpdate = true;
+  }
 }
 
 // ---------------------------------------------------------------------------

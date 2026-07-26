@@ -599,6 +599,12 @@ interface PropDef {
   scaleJitter: number;
   /** Per-instance tilt, radians. */
   tilt: number;
+  /**
+   * Per-instance albedo value spread. Debris wants a wide one — a rubble field
+   * where every chunk is the same value reads as one object stamped out N
+   * times, which is exactly what it is. Manufactured objects want a narrow one.
+   */
+  colorSpread?: number;
 }
 
 interface Instance {
@@ -722,7 +728,7 @@ export class PropSystem {
     const m = new THREE.Matrix4().compose(_p.set(x, y, z), _q, _s.set(s, s * (1 + this.rng.jitter(def.scaleJitter * 0.5)), s));
     // Per-instance albedo multiplier: ±7% value, ±4% warmth. Enough to break
     // the "one object repeated" read without turning the set into confetti.
-    const v = 1 + this.rng.jitter(0.075);
+    const v = 1 + this.rng.jitter(def.colorSpread ?? 0.075);
     const warm = this.rng.jitter(0.045);
     list.push({ matrix: m, color: new THREE.Color(v + warm, v, v - warm * 0.6) });
   }
@@ -1268,13 +1274,17 @@ export class PropSystem {
   private rubbleDef(rng: Rng): PropDef {
     const g = rubbleCone(0.55, 0.3, 5, rng.int(1, 9999), 0.13);
     scaleUv(g, 2.2);
+    // Broken masonry is not white. Untinted it renders as popcorn scattered on
+    // a dark road, which is the single loudest wrong note in any debris field.
+    tintGeometry(g, 0xa79c8b);
     return {
-      parts: [this.part(g, this.vault.get('rubble', { seed: 6 }), false, true)],
+      parts: [this.part(g, this.vault.get('rubble', { seed: 6, color: 0xa89d8a }), false, true)],
       boxes: [],
       surface: 'concrete',
       radius: 0.9,
       scaleJitter: 0.22,
       tilt: 0.06,
+      colorSpread: 0.17,
     };
   }
 
@@ -1290,12 +1300,13 @@ export class PropSystem {
     const merged = finalizeGeometry(mergeAll(parts));
     scaleUv(merged, 4);
     return {
-      parts: [this.part(merged, this.vault.get('brick', { seed: 8 }), false, true)],
+      parts: [this.part(merged, this.vault.get('brick', { seed: 8, color: 0x8d7261 }), false, true)],
       boxes: [],
       surface: 'concrete',
       radius: 0.42,
       scaleJitter: 0.25,
       tilt: 0.1,
+      colorSpread: 0.19,
     };
   }
 
@@ -1319,6 +1330,7 @@ export class PropSystem {
       radius: 0.3,
       scaleJitter: 0.3,
       tilt: 0.12,
+      colorSpread: 0.16,
     };
   }
 
@@ -1394,17 +1406,23 @@ export class PropSystem {
 
   private rebarDef(rng: Rng): PropDef {
     const parts: THREE.BufferGeometry[] = [];
-    for (let i = 0; i < 3; i++) {
-      const b = rebarGeo(rng.range(0.5, 1.15), rng.int(1, 9999), 0.011);
+    // Exposed reinforcement is 30-60cm of 10mm bar, not a metre and a half.
+    // At the old length, placed at the scales the level asks for, a tuft read
+    // as a dead bramble growing out of the masonry — three of them on one
+    // elevation and the wall looked overgrown rather than shelled.
+    for (let i = 0; i < 2; i++) {
+      const b = rebarGeo(rng.range(0.26, 0.6), rng.int(1, 9999), 0.0095);
       b.rotateY(rng.range(0, Math.PI * 2));
       b.rotateX(rng.jitter(0.5));
-      b.translate(rng.jitter(0.14), 0, rng.jitter(0.14));
+      b.translate(rng.jitter(0.1), 0, rng.jitter(0.1));
       parts.push(b);
     }
     const merged = finalizeGeometry(mergeAll(parts));
     scaleUv(merged, 5);
     return {
-      parts: [this.part(merged, this.vault.get('rusted_metal', { seed: 33, color: 0x8a4b2c }), true, true)],
+      // Lighter than it was: an 11mm bar in shadow at 0x8a4b2c resolves as a
+      // black wire, and black wire reads as a crack in the frame, not as steel.
+      parts: [this.part(merged, this.vault.get('rusted_metal', { seed: 33, color: 0xa87551 }), true, true)],
       boxes: [],
       surface: 'metal',
       radius: 0.7,

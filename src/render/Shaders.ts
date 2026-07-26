@@ -240,6 +240,10 @@ void main() {
   if ( d >= 0.9999995 ) { gl_FragColor = vec4( 1.0 ); return; }
 
   vec3 P = viewFromDepth( vUv, d, uInvProj );
+  // Past the fade range the result is forced to 1.0 anyway, so there is no
+  // reason to have marched for it. In a street shot most of the frame is
+  // beyond this, which makes the test worth more than it looks.
+  if ( -P.z > uFadeRange.y ) { gl_FragColor = vec4( 1.0 ); return; }
   vec3 V = normalize( -P );
 
   // Depth-derived normal. Picking the closer of the two one-sided differences
@@ -256,7 +260,7 @@ void main() {
   if ( dot( N, V ) < 0.0 ) N = -N;
 
   float noise = ignNoise( gl_FragCoord.xy + uFrame * 5.588238 );
-  float radiusPix = clamp( uRadius * uProjScaleY / max( 0.05, -P.z ), 4.0, 160.0 );
+  float radiusPix = clamp( uRadius * uProjScaleY / max( 0.05, -P.z ), 4.0, 110.0 );
 
   float visibility = 0.0;
 
@@ -284,7 +288,11 @@ void main() {
 
     for ( int k = 0; k < GTAO_STEPS; k ++ ) {
       float t = ( float( k ) + 0.5 + noise * 0.75 ) / float( GTAO_STEPS );
-      t = t * t; // bias samples toward the centre where contact detail lives
+      // Bias samples toward the centre, where contact detail lives. Squaring
+      // is the usual choice but it clusters too hard to survive a low step
+      // count; 1.6 keeps the outer sample far enough out that a two-step slice
+      // still spans the whole contact band.
+      t = pow( t, 1.6 );
       vec2 off = dir * ( t * radiusPix ) * uInvFullRes;
 
       vec2 uvA = vUv + off;
@@ -646,12 +654,15 @@ uniform mat4 uInvProj;
 uniform mat4 uCamWorld;
 uniform vec3 uCamPos;
 uniform float uAoStrength;
+uniform vec2 uAoLitRange;
+uniform float uAoDirectKeep;
 uniform float uSsrEnabled;
 uniform float uVolumeEnabled;
 uniform float uFogDensity;
 uniform float uFogHeightFalloff;
 uniform float uFogBaseHeight;
 uniform float uFogStart;
+uniform float uFogDesaturate;
 uniform vec3 uSkyZenith;
 uniform vec3 uSkyHorizon;
 uniform vec3 uSkyGround;
@@ -673,7 +684,16 @@ void main() {
 
   if ( !isSky ) {
     float ao = texture2D( tAo, vUv ).r;
-    ao = mix( 1.0, ao, uAoStrength );
+
+    // Occlusion belongs to the ambient term. Nothing here has a split
+    // direct/indirect buffer, but with the sun running roughly eight times the
+    // fill, scene luminance separates the two well enough: a pixel above the
+    // lit band is being hit by the key, and darkening it would be painting dirt
+    // into a sunlit corner. It keeps a fraction, because contact does block
+    // some of the bounce even in full sun.
+    float lit = smoothstep( uAoLitRange.x, uAoLitRange.y, lumaOf( color ) );
+    float aoW = uAoStrength * mix( 1.0, uAoDirectKeep, lit );
+    ao = mix( 1.0, ao, aoW );
     color *= multiBounce( ao, sat3( color * 1.6 ) );
 
     if ( uSsrEnabled > 0.5 ) {
@@ -706,8 +726,32 @@ void main() {
     optical = max( 0.0, optical - uFogStart * exp( -uFogHeightFalloff * hCam ) );
     float fog = 1.0 - exp( -uFogDensity * optical );
 
+    float aer = min( fog, 0.94 );
+
+    // Contrast and saturation go first, and they go faster than the colour
+    // replacement does. Air scatters a distant facade's own light out of the
+    // ray before it fills the ray back up with sky, so what you see at range is
+    // a *flatter, greyer* version of the surface with the sky laid over it —
+    // not the surface at full chroma under a wash. Doing only the wash is what
+    // makes engine fog look like a coloured sheet of glass.
+    float ls = lumaOf( color );
+    color = mix( color, vec3( ls ), aer * uFogDesaturate );
+    // Contrast toward the local mean as well, so distant value structure
+    // compresses instead of staying razor sharp under a lifted sky.
+    color = mix( color, vec3( mix( ls, 0.5, 0.35 ) ), aer * 0.22 );
+
+    // The haze itself is the sky radiance *along this pixel's view ray*, from
+    // the same analytic model that generates the dome and the IBL, so it is
+    // warm where the frame looks toward the sun and cool where it looks away
+    // and it can never disagree with the background it fades into.
     vec3 air = skyApprox( rd, uSkyZenith, uSkyHorizon, uSkyGround, uSunColor, uSunDir );
-    color = mix( color, air, min( fog, 0.94 ) );
+    // Ceiling on the haze. Looking into a low sun the analytic aureole runs to
+    // several times diffuse sky, and letting that into the aerial term turns
+    // every distant facade on the sun side into a white card. Real air does
+    // lift toward the aureole, but a camera exposed for the street does not
+    // resolve it that far above the sky's own diffuse level.
+    air = min( air, vec3( 2.2 ) );
+    color = mix( color, air, aer );
   }
 
   if ( uVolumeEnabled > 0.5 ) {
@@ -1034,6 +1078,8 @@ uniform vec3 uShadowTint;
 uniform vec3 uHighlightTint;
 uniform float uSaturation;
 uniform float uContrast;
+uniform float uToe;
+uniform float uShoulder;
 
 // Full ACES RRT+ODT fit (Stephen Hill), not the Narkowicz approximation:
 // the input/output matrices are what give ACES its highlight hue rotation.
@@ -1058,7 +1104,46 @@ vec3 acesFitted( vec3 c ) {
   c = ACES_IN * c;
   c = rrtOdtFit( c );
   c = ACES_OUT * c;
-  return sat3( c );
+  return max( vec3( 0.0 ), c );
+}
+
+/**
+ * Filmic S-curve applied on top of ACES.
+ *
+ * Three separate jobs, in order, and none of them clip:
+ *
+ *  - contrast as a power around the 18% pivot. A power has no discontinuity at
+ *    either end, unlike ( x - p ) * k + p, which is a straight line that runs
+ *    off both ends of the range and then gets clamped. That clamp is a hard
+ *    clip and it is why the old grade had neither black detail nor a highlight
+ *    roll — it traded both for a slightly steeper middle.
+ *  - a toe: extra density in the bottom couple of stops, on a smoothstep so it
+ *    fades out rather than banding. This is what puts a real black in the frame.
+ *  - a shoulder: a hyperbolic roll above uShoulder. It leaves the curve with
+ *    unit slope exactly at the knee — so there is no visible break where it
+ *    engages — and asymptotes to 1.0, so an arbitrarily bright highlight
+ *    compresses toward white and never reaches a flat clipped plateau. Only
+ *    the sun's own disc gets close.
+ *
+ * A shoulder that is normalised to put 1.0 at 1.0 is not a shoulder, it is a
+ * knee: forcing that endpoint makes the slope above the pivot *greater* than
+ * one, which expands the very highlights it is supposed to be compressing.
+ */
+vec3 toneShape( vec3 c, float contrast, float toe, float shoulder ) {
+  vec3 x = max( c, vec3( 0.0 ) );
+
+  x = pow( max( x / 0.18, vec3( 1e-5 ) ), vec3( contrast ) ) * 0.18;
+
+  vec3 t = sat3( x / 0.2 );
+  x *= mix( vec3( 1.0 ), t * t * ( 3.0 - 2.0 * t ), toe );
+
+  float s = clamp( shoulder, 0.05, 0.95 );
+  float range = 1.0 - s;
+  vec3 over = max( vec3( 0.0 ), x - s );
+  vec3 rolled = s + range * ( over / ( over + range ) );
+  x = mix( x, rolled, step( vec3( s ), x ) );
+
+  return sat3( x );
 }
 
 void main() {
@@ -1071,8 +1156,7 @@ void main() {
 
   color = acesFitted( color );
 
-  // Filmic contrast around 18% grey, applied before the grade.
-  color = sat3( ( color - 0.18 ) * uContrast + 0.18 );
+  color = toneShape( color, uContrast, uToe, uShoulder );
 
   // Lift / gamma / gain.
   color = sat3( color * ( uGain - uLift ) + uLift );
@@ -1298,7 +1382,19 @@ vec3 atmosphere( vec3 dir, out float sunDisc ) {
   return ( Lin + L0 ) * 0.04 + vec3( 0.0, 0.00035, 0.00085 );
 }
 
-// One cloud layer projected onto a flat plane at the given altitude.
+/**
+ * One cloud layer projected onto a flat plane at the given altitude.
+ *
+ * Returns ( sunlight reaching this point, coverage alpha, thin-edge factor ).
+ *
+ * A cloud is not an alpha mask with a gradient on it — it is a volume, and what
+ * makes it read as one is that light entering the sun-facing side has to travel
+ * through the volume to reach the side you are looking at. So instead of one
+ * gradient tap, this walks the density field toward the sun and accumulates
+ * optical depth, then applies Beer's law. The result is a dark base and a hot
+ * sunward shoulder on the *same* cloud, which is the whole difference between a
+ * cloud and a wisp of grey paint.
+ */
 vec4 cloudLayer( vec3 dir, float height, float scale, vec2 drift, float cover, float sharpness ) {
   if ( dir.y <= 0.012 ) return vec4( 0.0 );
   float t = height / dir.y;
@@ -1313,15 +1409,30 @@ vec4 cloudLayer( vec3 dir, float height, float scale, vec2 drift, float cover, f
   float density = sat( ( d - cover ) * sharpness );
   if ( density <= 0.001 ) return vec4( 0.0 );
 
-  // Gradient toward the sun gives the lit rim without a second march.
-  vec2 sunProj = normalize( uSunDir.xz + vec2( 1e-4 ) ) * 0.22;
-  float dSun = fbm5( p + sunProj );
-  float rim = sat( ( d - dSun ) * 2.6 + 0.45 );
+  // Three taps along the sun's projection into the layer's plane, weighted so
+  // the near ones dominate. fbm3 rather than fbm5 — self-shadowing needs the
+  // low frequencies of the field, not its detail, and this keeps the layer at
+  // roughly the cost of the single fbm5 tap it replaces.
+  vec2 sunStep = normalize( uSunDir.xz + vec2( 1e-4 ) ) * 0.19;
+  float od =
+    sat( ( fbm3( p + sunStep ) - cover ) * sharpness ) * 1.00 +
+    sat( ( fbm3( p + sunStep * 2.3 ) - cover ) * sharpness ) * 0.62 +
+    sat( ( fbm3( p + sunStep * 4.4 ) - cover ) * sharpness ) * 0.34;
+
+  // Beer's law through the accumulated depth, plus a self-occlusion term from
+  // the point's own density so the middle of a thick cell is darker than its
+  // shoulder even when nothing upwind of it is.
+  float lightThrough = exp( -( od * 1.5 + density * 0.9 ) );
+
+  // Thin edges: where the cell has only just crossed the coverage threshold,
+  // light passes almost straight through. This is the term that becomes the
+  // silver lining when the sun is behind that edge.
+  float thin = ( 1.0 - density ) * smoothstep( 0.0, 0.28, density );
 
   float horizonFade = smoothstep( 0.012, 0.14, dir.y );
   float distFade = 1.0 - sat( ( t * scale - 26.0 ) / 60.0 );
 
-  return vec4( rim, density * horizonFade * mix( 0.35, 1.0, distFade ), 0.0, 0.0 );
+  return vec4( lightThrough, density * horizonFade * mix( 0.35, 1.0, distFade ), thin, 0.0 );
 }
 
 void main() {
@@ -1338,26 +1449,50 @@ void main() {
   sky = mix( sky, ground, below );
 
   if ( dir.y > 0.012 ) {
-    float sunAmt = sat( dot( dir, uSunDir ) * 0.5 + 0.5 );
+    float cosSun = dot( dir, uSunDir );
+    float sunAmt = sat( cosSun * 0.5 + 0.5 );
 
     vec4 low = cloudLayer( dir, 1.0, 1.35, vec2( 0.0042, 0.0017 ), uCloudCover, 3.4 );
     vec4 high = cloudLayer( dir, 2.6, 0.62, vec2( 0.0115, -0.0038 ), uCloudCover + 0.12, 2.2 );
 
-    vec3 litLow = mix( vec3( 0.18, 0.19, 0.24 ), vec3( 1.05, 0.92, 0.76 ), low.x );
-    litLow *= mix( 0.85, 1.5, sunAmt );
-    vec3 litHigh = mix( vec3( 0.38, 0.40, 0.46 ), vec3( 1.00, 0.92, 0.82 ), high.x );
-    litHigh *= mix( 0.9, 1.35, sunAmt );
+    // Shadowed cloud is not grey: its underside is lit by the sky above it and
+    // by the ground below, so it goes blue-grey with a warm floor. The sunward
+    // shoulder takes the sun's own colour, warm and well over unity so it can
+    // clip into the bloom the way a real cloud edge does at this hour.
+    vec3 shadeLow = vec3( 0.20, 0.23, 0.31 ) * uIntensity + horizonCol * 0.25;
+    vec3 shadeHigh = vec3( 0.34, 0.37, 0.45 ) * uIntensity + horizonCol * 0.18;
+    vec3 litLow = mix( shadeLow, vec3( 1.55, 1.36, 1.10 ) * uIntensity, low.x );
+    vec3 litHigh = mix( shadeHigh, vec3( 1.32, 1.22, 1.08 ) * uIntensity, high.x );
+
+    // Silver lining. Forward scatter through a thin edge, so it only appears
+    // where the sun is actually behind that edge, and it falls off sharply with
+    // angle rather than glowing everywhere on the sunward half of the sky.
+    float forward = pow( sat( cosSun ), 7.0 );
+    vec3 silver = vec3( 1.9, 1.62, 1.24 ) * uIntensity * forward;
+    litLow += silver * low.z * 2.6;
+    litHigh += silver * high.z * 1.8;
+
+    litLow *= mix( 0.88, 1.22, sunAmt );
+    litHigh *= mix( 0.92, 1.16, sunAmt );
 
     float aHigh = high.y * 0.55;
-    float aLow = low.y * 0.92;
+    float aLow = low.y * 0.94;
 
-    sky = mix( sky, litHigh * uIntensity * 0.85, sat( aHigh ) );
-    sky = mix( sky, litLow * uIntensity * 0.9, sat( aLow ) );
+    sky = mix( sky, litHigh * 0.85, sat( aHigh ) );
+    sky = mix( sky, litLow * 0.9, sat( aLow ) );
   }
 
-  // Horizon haze band: real air never lets the horizon meet the ground clean.
-  float hazeBand = exp( -abs( dir.y ) * 14.0 );
-  sky = mix( sky, sky * vec3( 1.08, 1.02, 0.96 ) + horizonCol * 0.18, hazeBand * 0.55 );
+  // Horizon haze band. Real air never lets the horizon meet the ground clean,
+  // and this is also the band the aerial-perspective pass fades distant
+  // geometry into — if the two disagree the far buildings sit on a seam.
+  // Widened and strengthened so the transition happens over degrees, not over
+  // a hairline.
+  float hazeBand = exp( -abs( dir.y ) * 9.0 );
+  // Clamped: looking along a low sun the horizon sample sits inside the Mie
+  // aureole, and smearing that across the whole haze band is what turns the
+  // bottom third of a backlit sky into one flat white card.
+  vec3 haze = min( horizonCol, vec3( 1.6 ) ) * 1.04 + vec3( 0.012, 0.013, 0.015 ) * uIntensity;
+  sky = mix( sky, mix( sky, haze, 0.5 ) * vec3( 1.04, 1.01, 0.975 ), hazeBand * 0.5 );
 
   sky = min( sky, vec3( uExposureClamp ) );
   gl_FragColor = vec4( max( vec3( 0.0 ), sky ), 1.0 );

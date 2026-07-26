@@ -5,10 +5,36 @@ import { DEFAULT_SKY_PARAMS, DEFAULT_TIME_OF_DAY, sunDirectionForTime, sunLightC
 
 /** Nearest cascade starts here; closer than this nothing casts a visible shadow. */
 const SHADOW_NEAR = 0.25;
-/** Beyond this the cascades stop and geometry is lit but unshadowed. */
-const SHADOW_DISTANCE = 165;
-/** 0 = uniform splits, 1 = logarithmic. 0.5 is the classic practical blend. */
-const SPLIT_LAMBDA = 0.5;
+/**
+ * Beyond this the cascades stop and geometry is lit but unshadowed.
+ *
+ * 165m sounds generous and is in fact the reason contact shadows were mush: the
+ * low preset gets two cascades and a 1024 map, so the near cascade had to span
+ * 44m, which at this field of view is a 73m bounding sphere — 0.14m per shadow
+ * texel, and a normal-offset bias of a fifth of a metre. Nothing survives that.
+ * At 92m the near cascade covers 20m at 0.06m per texel and building-to-ground
+ * contact is crisp, while the aerial perspective has taken over well before
+ * anything at 92m could miss its shadow.
+ */
+const SHADOW_DISTANCE = 92;
+/** 0 = uniform splits, 1 = logarithmic. Weighted toward log to buy near detail. */
+const SPLIT_LAMBDA = 0.62;
+/**
+ * Normal-offset bias is derived per cascade from its texel size, but the far
+ * cascade's texels are large enough that the honest value would visibly detach
+ * shadows from their casters. Capped, and the depth bias carries the remainder.
+ */
+const MAX_NORMAL_BIAS = 0.2;
+/** Sky fill as an absolute intensity — see the HemisphereLight construction. */
+const HEMI_INTENSITY = 0.26;
+/** Warm single-bounce fill, as a fraction of the sun. */
+const BOUNCE_FRACTION = 0.19;
+/**
+ * The viewmodel rig's intensities were authored against the old exposure. The
+ * pipeline now runs about two thirds of a stop darker so that the sun can be
+ * brighter without clipping, and the weapon has to be told, or it sinks.
+ */
+const VIEW_LIGHT_GAIN = 1.5;
 /** How far back along the sun ray each cascade's ortho camera sits. */
 const CASCADE_BACK_DISTANCE = 95;
 const MAX_SHADOW_LOCALS = 4;
@@ -54,18 +80,32 @@ export class LightingSystem implements System {
   /** Direction pointing *towards* the sun. */
   readonly sunDirection = new THREE.Vector3();
   readonly sunColor = new THREE.Color(0xffd9a8);
-  sunIntensity = 5.0;
+  /**
+   * The key. Everything else in this file is expressed as a fraction of it so
+   * the contrast ratio cannot drift when the sun is retimed.
+   *
+   * Golden-hour sun to skylight is 6:1 to 10:1 in linear terms. The fill side
+   * of that budget is 0.55 of IBL + 0.26 of hemisphere + a 1.18 bounce that
+   * only reaches surfaces facing the lit side of the street, so a shadowed
+   * plane sees somewhere near 1.0 against this 7.4 — a little over three stops,
+   * which lands shadowed asphalt around 0.08 and sunlit plaster around 0.75
+   * once the grade has had it. Push the ratio further and the shadows crush;
+   * that is not a stylistic limit, it is where detail stops existing.
+   */
+  sunIntensity = 9.2;
 
   readonly cascades: CascadeInfo[] = [];
 
   private ctx: GameContext | null = null;
   private hemi: THREE.HemisphereLight | null = null;
   /**
-   * Fake single-bounce fill. There is no GI here, and without it a street in a
-   * building's shadow is lit only by a blue sky and renders as navy. Real
-   * shadowed asphalt between sunlit sandstone facades picks up a warm bounce
-   * roughly a stop and a half under the key. Shadowless, so it costs one extra
-   * light term and nothing else.
+   * Fake single-bounce fill, and the reason the shadows can afford to be as
+   * dark as they now are. There is no GI here, so a street in a building's
+   * shadow would otherwise be lit by sky alone and render navy no matter how
+   * the sky is tuned. This comes back off the sunlit facades opposite: warm,
+   * low, roughly two and a half stops under the key, and shadowless — one
+   * extra light term and nothing else. It is what makes shadowed asphalt read
+   * as warm grey rather than as blue ink.
    */
   private bounce: THREE.DirectionalLight | null = null;
   private readonly locals: LocalLightEntry[] = [];
@@ -133,19 +173,20 @@ export class LightingSystem implements System {
       this.cascades.push({ light, far: this.splits[i + 1], radius: 1 });
     }
 
-    // Cool sky fill. The IBL already carries most of the ambient, so this is
-    // deliberately restrained — it exists to keep shadow interiors from going
-    // to a flat neutral.
-    // Sky fill, pulled off full saturation so shadows read as cool, not navy.
-    const skyFill = new THREE.Color(0xcdd4de);
+    // Sky fill. Small, and *chromatic on purpose*: this is the term that makes
+    // an up-facing surface in shadow read cool while the sun makes a lit one
+    // read warm, and that warm/cool split across a single object is most of
+    // what people actually mean by "cinematic". The previous 0xcdd4de at 0.55
+    // was neither — near-white and loud enough to flatten the whole canyon.
+    const skyFill = new THREE.Color(0x86a3c8);
     const groundFill = sky ? new THREE.Color().copy(sky.groundColor) : new THREE.Color(0x6b5a44);
     const gm = Math.max(groundFill.r, groundFill.g, groundFill.b, 1e-3);
     if (gm > 1) groundFill.multiplyScalar(1 / gm);
-    this.hemi = new THREE.HemisphereLight(skyFill, groundFill, 0.55);
+    this.hemi = new THREE.HemisphereLight(skyFill, groundFill, HEMI_INTENSITY);
     this.hemi.position.set(0, 60, 0);
     ctx.scene.add(this.hemi);
 
-    const bounce = new THREE.DirectionalLight(0xffd6a6, this.sunIntensity * 0.20);
+    const bounce = new THREE.DirectionalLight(0xffcb98, this.sunIntensity * BOUNCE_FRACTION);
     bounce.name = 'sun-bounce';
     bounce.castShadow = false;
     ctx.scene.add(bounce);
@@ -270,7 +311,7 @@ export class LightingSystem implements System {
       // Normal-offset bias in world units: one and a half texels of the
       // cascade that will actually sample this fragment. Constant bias alone
       // either acnes on grazing surfaces or peter-pans on flat ones.
-      light.shadow.normalBias = texelWorld * 1.6;
+      light.shadow.normalBias = Math.min(texelWorld * 1.6, MAX_NORMAL_BIAS);
       light.shadow.bias = -0.00012;
 
       light.target.updateMatrixWorld(true);
@@ -286,7 +327,7 @@ export class LightingSystem implements System {
         .normalize();
       bounce.position.copy(_eye).multiplyScalar(30).add(camera.position);
       bounce.target.position.copy(camera.position);
-      bounce.intensity = this.sunIntensity * 0.20;
+      bounce.intensity = this.sunIntensity * BOUNCE_FRACTION;
       bounce.updateMatrixWorld(true);
       bounce.target.updateMatrixWorld(true);
     }
@@ -325,7 +366,7 @@ export class LightingSystem implements System {
     ctx.viewScene.add(key.target);
     this.viewSun = key;
 
-    const fill = new THREE.HemisphereLight(0x8fb3ff, 0x6b5a44, 0.3);
+    const fill = new THREE.HemisphereLight(0x7d9cc6, 0x6b5a44, 0.16);
     ctx.viewScene.add(fill);
     this.viewFill = fill;
 
@@ -355,7 +396,7 @@ export class LightingSystem implements System {
     if (this.borrowedViewLights.length > 0) {
       // Never fully dark: a weapon in shade is still lit by the sky and by
       // bounce off the ground, which is what the 0.34 floor stands in for.
-      const k = 0.34 + 0.66 * this.viewSunExposure;
+      const k = (0.34 + 0.66 * this.viewSunExposure) * VIEW_LIGHT_GAIN;
       for (const entry of this.borrowedViewLights) entry.light.intensity = entry.base * k;
     }
     if (!key) return;
@@ -367,7 +408,7 @@ export class LightingSystem implements System {
     key.updateMatrixWorld(true);
     key.target.updateMatrixWorld(true);
 
-    if (this.viewFill) this.viewFill.intensity = 0.3 - 0.09 * this.viewSunExposure;
+    if (this.viewFill) this.viewFill.intensity = 0.16 - 0.05 * this.viewSunExposure;
   }
 
   private updateLocals(camera: THREE.PerspectiveCamera): void {
