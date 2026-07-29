@@ -155,6 +155,40 @@ function measure(png) {
     }
   }
 
+  // Local contrast, measured on 32x32 tiles. Global percentiles cannot tell a
+  // structured frame from a flat pale wash: pulling a blown region from 0.95
+  // down to 0.85 passes a brightness threshold while remaining featureless.
+  // What actually distinguishes them is whether detail survives inside a tile.
+  const TILE = 32;
+  const tileSd = [];
+  let flatBright = 0;
+  let tiles = 0;
+  for (let ty = 0; ty + TILE <= h; ty += TILE) {
+    for (let tx = 0; tx + TILE <= w; tx += TILE) {
+      if (isHud(tx + TILE / 2, ty + TILE / 2, w, h)) continue;
+      let s1 = 0;
+      let s2 = 0;
+      let m = 0;
+      for (let y = ty; y < ty + TILE; y += 2) {
+        for (let x = tx; x < tx + TILE; x += 2) {
+          const i = (y * w + x) * ch;
+          const l = lumaOf(data[i], data[i + 1], data[i + 2]);
+          s1 += l;
+          s2 += l * l;
+          m++;
+        }
+      }
+      const mean = s1 / m;
+      const sd = Math.sqrt(Math.max(0, s2 / m - mean * mean));
+      tileSd.push(sd);
+      // Bright and featureless: the signature of veiling glare and of distant
+      // geometry that has lifted into a pale cutout.
+      if (mean > 0.62 && sd < 0.025) flatBright++;
+      tiles++;
+    }
+  }
+  const localContrast = tileSd.reduce((a, v) => a + v, 0) / Math.max(tiles, 1);
+
   lums.sort((a, b) => a - b);
   const pct = (p) => lums[Math.min(lums.length - 1, Math.floor(lums.length * p))];
 
@@ -166,6 +200,8 @@ function measure(png) {
     midBandFraction: +(band / n).toFixed(4),
     meanSaturation: +(sumSat / n).toFixed(4),
     glareFraction: +(clipped / n).toFixed(4),
+    localContrast: +localContrast.toFixed(4),
+    flatBrightFraction: +(flatBright / Math.max(tiles, 1)).toFixed(4),
     // Warm/cool balance of the whole frame. Golden hour should sit slightly
     // above 1; far above it means the grade has collapsed toward sepia and the
     // frame has stopped reading as light on varied materials.
@@ -223,14 +259,14 @@ if (probeArg) {
 
 writeFileSync(resolve(dir, 'metrics.json'), JSON.stringify(results, null, 2));
 
-const HEAD = ['pose', 'p1', 'p50', 'p99', 'range', 'midBand', 'sat', 'glare', 'R/B'];
+const HEAD = ['pose', 'p1', 'p50', 'p99', 'range', 'midBand', 'sat', 'glare', 'R/B', 'lcon', 'flat'];
 const pad = (s, n) => String(s).padEnd(n);
 console.log(`\n${basename(dir)}`);
 console.log(HEAD.map((x, i) => pad(x, i === 0 ? 10 : 9)).join(''));
 for (const [name, m] of Object.entries(results)) {
   console.log(
     pad(name, 10) + [m.p1, m.p50, m.p99, m.dynamicRange, m.midBandFraction,
-                     m.meanSaturation, m.glareFraction, m.frameRedOverBlue]
+                     m.meanSaturation, m.glareFraction, m.frameRedOverBlue, m.localContrast, m.flatBrightFraction]
       .map((v) => pad(v.toFixed(3), 9)).join(''),
   );
 }
@@ -252,12 +288,13 @@ if (vsDir) {
       pad(name, 10) +
         [d(m.p1, o.p1), d(m.p50, o.p50), d(m.p99, o.p99), d(m.dynamicRange, o.dynamicRange),
          d(m.midBandFraction, o.midBandFraction), d(m.meanSaturation, o.meanSaturation),
-         d(m.glareFraction, o.glareFraction), d(m.frameRedOverBlue, o.frameRedOverBlue)]
+         d(m.glareFraction, o.glareFraction), d(m.frameRedOverBlue, o.frameRedOverBlue),
+         d(m.localContrast, o.localContrast), d(m.flatBrightFraction, o.flatBrightFraction)]
           .map((v) => pad(v, 9)).join(''),
     );
   }
 }
 
-console.log(`\nTargets: p1 < 0.03 · range > 0.75 · midBand < 0.55 · glare < 0.06 · R/B 1.00-1.20`);
+console.log(`\nTargets: p1 < 0.03 · range > 0.75 · midBand < 0.55 · glare < 0.06 · R/B 1.00-1.20 · lcon > 0.055 · flat < 0.10`);
 console.log(`midBand is the fraction of non-HUD pixels inside sRGB [0.13, 0.40] —`);
 console.log(`the rubric's "uniform mid-grey mush" failure expressed as a number.\n`);
