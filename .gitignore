@@ -4,7 +4,9 @@ dist/
 qa/shots/
 *.log
 # Scratch validation scripts agents write while checking their own work.
+# The convention is a leading dot; qa/measure.mjs is the permanent version.
 .*check.mjs
+qa/.*.mjs
 .DS_Store
 
 # Generated blind-comparison pairs (regenerate with qa/blind.mjs).
