@@ -124,6 +124,10 @@ function measure(png) {
   let sumSat = 0;
   let n = 0;
   let band = 0;
+  let clipped = 0;
+  let sumR = 0;
+  let sumG = 0;
+  let sumB = 0;
 
   for (let y = 0; y < h; y += 2) {
     for (let x = 0; x < w; x += 2) {
@@ -137,8 +141,16 @@ function measure(png) {
       const mx = Math.max(r, g, b);
       const mn = Math.min(r, g, b);
       sumSat += mx === 0 ? 0 : (mx - mn) / mx;
+      sumR += r;
+      sumG += g;
+      sumB += b;
       // The rubric's "uniform mid-grey mush" failure, as a number.
       if (l >= 0.13 && l <= 0.40) band++;
+      // Veiling glare. Hard clipping (all channels at 255) turns out to be
+      // rare; what actually destroys these frames is a large region sitting
+      // near-white with its local contrast washed away, so an arch opening and
+      // the wall around it become the same value. Measure that, not clipping.
+      if (l >= 0.90) clipped++;
       n++;
     }
   }
@@ -153,6 +165,11 @@ function measure(png) {
     dynamicRange: +(pct(0.99) - pct(0.01)).toFixed(4),
     midBandFraction: +(band / n).toFixed(4),
     meanSaturation: +(sumSat / n).toFixed(4),
+    glareFraction: +(clipped / n).toFixed(4),
+    // Warm/cool balance of the whole frame. Golden hour should sit slightly
+    // above 1; far above it means the grade has collapsed toward sepia and the
+    // frame has stopped reading as light on varied materials.
+    frameRedOverBlue: +(sumR / Math.max(sumB, 1)).toFixed(3),
   };
 }
 
@@ -206,13 +223,14 @@ if (probeArg) {
 
 writeFileSync(resolve(dir, 'metrics.json'), JSON.stringify(results, null, 2));
 
-const HEAD = ['pose', 'p1', 'p50', 'p99', 'range', 'midBand', 'sat'];
+const HEAD = ['pose', 'p1', 'p50', 'p99', 'range', 'midBand', 'sat', 'glare', 'R/B'];
 const pad = (s, n) => String(s).padEnd(n);
 console.log(`\n${basename(dir)}`);
 console.log(HEAD.map((x, i) => pad(x, i === 0 ? 10 : 9)).join(''));
 for (const [name, m] of Object.entries(results)) {
   console.log(
-    pad(name, 10) + [m.p1, m.p50, m.p99, m.dynamicRange, m.midBandFraction, m.meanSaturation]
+    pad(name, 10) + [m.p1, m.p50, m.p99, m.dynamicRange, m.midBandFraction,
+                     m.meanSaturation, m.glareFraction, m.frameRedOverBlue]
       .map((v) => pad(v.toFixed(3), 9)).join(''),
   );
 }
@@ -233,12 +251,13 @@ if (vsDir) {
     console.log(
       pad(name, 10) +
         [d(m.p1, o.p1), d(m.p50, o.p50), d(m.p99, o.p99), d(m.dynamicRange, o.dynamicRange),
-         d(m.midBandFraction, o.midBandFraction), d(m.meanSaturation, o.meanSaturation)]
+         d(m.midBandFraction, o.midBandFraction), d(m.meanSaturation, o.meanSaturation),
+         d(m.glareFraction, o.glareFraction), d(m.frameRedOverBlue, o.frameRedOverBlue)]
           .map((v) => pad(v, 9)).join(''),
     );
   }
 }
 
-console.log(`\nTargets: p1 < 0.03 (a true black exists) · range > 0.75 · midBand < 0.55`);
+console.log(`\nTargets: p1 < 0.03 · range > 0.75 · midBand < 0.55 · glare < 0.06 · R/B 1.00-1.20`);
 console.log(`midBand is the fraction of non-HUD pixels inside sRGB [0.13, 0.40] —`);
 console.log(`the rubric's "uniform mid-grey mush" failure expressed as a number.\n`);
