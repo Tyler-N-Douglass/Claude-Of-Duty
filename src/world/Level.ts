@@ -89,6 +89,14 @@ interface SurfaceDef {
   emissive?: number;
   emissiveIntensity?: number;
   side?: THREE.Side;
+  /**
+   * Reflected-environment weight. Exposed because a genuinely dark diffuse — a
+   * road at 0.10 reflectance — is the one case where the sky's specular term is
+   * a larger share of the surface than the surface is, and the default weight
+   * then paints the dome's colour straight onto the tarmac.
+   */
+  envMapIntensity?: number;
+  normalScale?: number;
   /** Overrides the look's default surface kind for footsteps and impacts. */
   kind?: SurfaceKind;
 }
@@ -99,14 +107,55 @@ interface SurfaceDef {
  * comes from *value* and *wear*, not hue.
  */
 const SURFACES = {
-  sand: { look: 'sand', tiles: 0.42, seed: 1 },
-  // The asphalt map is already authored at a road's real 0.09-0.13 reflectance.
-  // Tinting it down another two thirds left the street darker than the sky's
-  // specular reflection on it, which is what made shaded tarmac render navy.
-  road: { look: 'asphalt', tiles: 0.34, seed: 2, color: 0xd9d3c7 },
-  pavement: { look: 'concrete_floor', tiles: 0.46, seed: 3, color: 0xbdb4a1 },
-  paving: { look: 'tile_floor', tiles: 0.5, seed: 4, color: 0xb5aa93 },
-  dirt: { look: 'dirt_gravel', tiles: 0.55, seed: 5 },
+  /**
+   * Ground grain, and the reason the 200x200 crop test failed at 1-3m.
+   *
+   * A sand map repeating every 2.4m at a normal scale of 0.9 has nothing in it
+   * above about a fifth of a metre once the shoulder of the grade has taken a
+   * quarter of its contrast off, and a large smooth mass at arm's length is the
+   * most obvious tell there is. Shortening the repeat and driving the relief
+   * harder puts ripple detail back at the scale a 21-degree sun can actually
+   * shade: at this elevation a 6mm ripple crest throws a 15mm shadow, so the
+   * normal is doing far more work here than on any vertical surface.
+   */
+  sand: { look: 'sand', tiles: 0.66, seed: 1, normalScale: 1.45 },
+  /**
+   * Tarmac, at a road's real reflectance.
+   *
+   * This carried a 0xd9d3c7 tint — a warm near-white — laid over a map already
+   * authored at 0.09-0.13. That is a 3.5x multiplier on the largest surface in
+   * the frame, and it measured a *higher* albedo than the concrete barriers
+   * standing on it. The justification was that untinted tarmac went navy, and
+   * that was true, but it was never an albedo problem: a 0.10 diffuse under a
+   * clear sky is the one case in the level where the reflected environment is a
+   * larger share of the pixel than the surface itself, and the look's default
+   * envMapIntensity of 0.95 was therefore painting the dome's own hue straight
+   * onto the road. Dropping the environment weight to a third and floor-ing the
+   * roughness solves it where it lives. The grade's shoulder and film black
+   * both landed after that tint was authored, so a 0.10 surface now has three
+   * usable stops under it instead of bottoming out at the old lift.
+   */
+  road: {
+    look: 'asphalt', tiles: 0.44, seed: 2, color: 0x8f8a83,
+    roughness: 0.94, envMapIntensity: 0.3, normalScale: 1.3,
+  },
+  /**
+   * Wheel paths. Two 1.2m bands where fifty thousand tyres have polished the
+   * aggregate flat and pressed the binder up: darker, and glossier along the
+   * direction of travel, which is what makes a road read as travelled rather
+   * than as a dark stripe. Laid 4mm proud so it never fights the carriageway.
+   */
+  roadWear: { look: 'asphalt', tiles: 0.38, seed: 6, color: 0x7d786f, roughness: 0.72, envMapIntensity: 0.45 },
+  /**
+   * Tar seam repairs and crack fill. Fresh bitumen against weathered tarmac is
+   * the strongest value edge a road surface has, and it is nearly black.
+   */
+  roadTar: { look: 'asphalt', tiles: 0.9, seed: 7, color: 0x4a4642, roughness: 0.62, envMapIntensity: 0.35 },
+  /** Drifted sand lying on the carriageway — the light half of the road's value split. */
+  roadDrift: { look: 'sand', tiles: 0.5, seed: 8, color: 0xcdbd9e },
+  pavement: { look: 'concrete_floor', tiles: 0.6, seed: 3, color: 0xb2a996, normalScale: 1.25 },
+  paving: { look: 'tile_floor', tiles: 0.5, seed: 4, color: 0xa89e88, normalScale: 1.2 },
+  dirt: { look: 'dirt_gravel', tiles: 0.74, seed: 5, normalScale: 1.35 },
 
   // One family, five values. Every tint sits within about 12 degrees of hue of
   // the next; what separates the buildings is how light they are and how much
@@ -483,6 +532,158 @@ export class LevelSystem implements System {
   }
 
   /**
+   * A ribbon of ground running along Z, with a wandering centreline and a
+   * width that breathes along its length.
+   *
+   * Everything laid on the carriageway is one of these. The wander is the
+   * point: a wheel path is worn by drivers, and drivers do not track a
+   * straight line, so a perfectly straight band reads as a decal. Sitting the
+   * ribbon a few millimetres proud of the road keeps it out of any depth fight
+   * without ever being visible as a step at a 1.6m eye height.
+   */
+  private ribbonZ(
+    xc: number,
+    halfW: number,
+    z0: number,
+    z1: number,
+    y: number,
+    seed: number,
+    opts: { wander?: number; breathe?: number; step?: number; relief?: number } = {},
+  ): THREE.BufferGeometry {
+    const wander = opts.wander ?? 0.16;
+    const breathe = opts.breathe ?? 0.18;
+    const step = opts.step ?? 1.1;
+    const relief = opts.relief ?? 0.006;
+    const rng = new Rng(seed);
+    const rows = Math.max(2, Math.round((z1 - z0) / step));
+    const pa: number[] = [];
+    const na: number[] = [];
+    const phase = rng.range(0, 6.28);
+    const phase2 = rng.range(0, 6.28);
+
+    const at = (r: number) => {
+      const z = z0 + ((z1 - z0) * r) / rows;
+      const cx =
+        xc +
+        Math.sin(z * 0.081 + phase) * wander +
+        Math.sin(z * 0.29 + phase2) * wander * 0.34;
+      const hw = halfW * (1 + Math.sin(z * 0.17 + phase2) * breathe);
+      // Bitumen sits in a shallow trough where it has been pressed down.
+      const yy = y + Math.sin(z * 0.61 + phase) * relief;
+      return [cx, hw, yy, z] as const;
+    };
+
+    for (let r = 0; r < rows; r++) {
+      const [c0, h0, y0, za] = at(r);
+      const [c1, h1, y1, zb] = at(r + 1);
+      const quad = [
+        [c0 - h0, y0, za], [c0 + h0, y0, za], [c1 + h1, y1, zb],
+        [c0 - h0, y0, za], [c1 + h1, y1, zb], [c1 - h1, y1, zb],
+      ];
+      for (const v of quad) {
+        pa.push(v[0], v[1], v[2]);
+        na.push(0, 1, 0);
+      }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pa), 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(na), 3));
+    return finalizeGeometry(geo);
+  }
+
+  /** As `ribbonZ`, but running along X. */
+  private ribbonX(
+    zc: number,
+    halfW: number,
+    x0: number,
+    x1: number,
+    y: number,
+    seed: number,
+    opts: { wander?: number; breathe?: number; step?: number; relief?: number } = {},
+  ): THREE.BufferGeometry {
+    // Rotating about Y by a quarter turn maps the ribbon's run onto X and its
+    // width onto Z, and flips the sign of the width axis — hence the -zc.
+    const geo = this.ribbonZ(-zc, halfW, x0, x1, y, seed, opts);
+    geo.rotateY(Math.PI * 0.5);
+    return geo;
+  }
+
+  /**
+   * What has happened to the carriageway since it was laid.
+   *
+   * The road was the single largest untold surface in the frame: one value,
+   * one roughness, forty metres long. Three things fix that, and all three are
+   * things you can point at in a photograph of a real street —
+   *
+   *  - two polished wheel paths, darker and glossier than the lane around them,
+   *  - transverse construction joints and snaking longitudinal repairs in fresh
+   *    black bitumen, which is the strongest value edge tarmac ever has,
+   *  - drifted sand along the kerb line, which is the light half of the split
+   *    and ties the road to the desert it is sitting in.
+   *
+   * Together they give the carriageway a dark value, a mid value and a light
+   * value inside every square metre, which is what a squint test is looking for.
+   */
+  private roadSurfacing(): void {
+    // Wheel paths: one dominant track per lane, 1.2m across.
+    for (const [xc, seed] of [[-3.35, 601], [3.55, 602]] as const) {
+      this.add('mid', 'roadWear', this.ribbonZ(xc, 0.6, -41, 41, 0.004, seed, { wander: 0.22, breathe: 0.14 }));
+    }
+    // Their fainter partners, half worn.
+    for (const [xc, seed] of [[-1.5, 603], [5.4, 604]] as const) {
+      this.add('mid', 'roadWear', this.ribbonZ(xc, 0.42, -41, 41, 0.003, seed, { wander: 0.3, breathe: 0.26 }));
+    }
+
+    // Transverse construction joints, at an irregular pitch and never square
+    // to the kerb — a paving train does not stop on a grid.
+    const jr = new Rng(610);
+    for (let z = -38; z < 40; z += 6.5 + jr.range(0, 4.5)) {
+      this.add(
+        'mid', 'roadTar',
+        this.ribbonX(z, 0.085, ROAD_W0 + 0.1, ROAD_W1 - 0.1, 0.007, 611 + Math.round(z * 7), {
+          wander: 0.09, breathe: 0.3, step: 1.4, relief: 0.001,
+        }),
+      );
+    }
+
+    // Longitudinal repairs: long snaking crack fill down the lane divide and
+    // along the kerb line, where a road always fails first.
+    this.add('mid', 'roadTar', this.ribbonZ(0.1, 0.075, -39, 39, 0.008, 620, { wander: 0.55, breathe: 0.4, step: 1.6 }));
+    this.add('mid', 'roadTar', this.ribbonZ(-5.9, 0.06, -30, 22, 0.008, 621, { wander: 0.42, breathe: 0.45, step: 1.9 }));
+    this.add('mid', 'roadTar', this.ribbonZ(6.1, 0.055, -18, 36, 0.008, 622, { wander: 0.38, breathe: 0.5, step: 2.1 }));
+
+    // Cracking. Short branching runs off the repairs, thin enough that they
+    // read as fracture rather than as more seam.
+    const cr = new Rng(630);
+    for (let i = 0; i < 26; i++) {
+      const z = cr.range(-38, 38);
+      const x = cr.range(ROAD_W0 + 0.6, ROAD_W1 - 0.6);
+      const len = cr.range(1.6, 5.2);
+      if (cr.chance(0.55)) {
+        this.add('mid', 'roadTar', this.ribbonZ(x, 0.026, z, z + len, 0.009, 631 + i, {
+          wander: 0.5, breathe: 0.55, step: 0.7, relief: 0,
+        }));
+      } else {
+        this.add('mid', 'roadTar', this.ribbonX(z, 0.026, x, x + Math.min(len, ROAD_W1 - 0.4 - x), 0.009, 631 + i, {
+          wander: 0.5, breathe: 0.55, step: 0.7, relief: 0,
+        }));
+      }
+    }
+
+    // Sand drifted in against both kerbs and in the lee of the square.
+    this.add('mid', 'roadDrift', this.ribbonZ(ROAD_W0 + 0.75, 0.78, -41, 41, 0.011, 640, { wander: 0.5, breathe: 0.42, step: 1.5 }));
+    this.add('mid', 'roadDrift', this.ribbonZ(ROAD_W1 - 0.66, 0.62, -41, 12, 0.011, 641, { wander: 0.55, breathe: 0.5, step: 1.5 }));
+    const dr = new Rng(650);
+    for (let i = 0; i < 9; i++) {
+      const z = dr.range(-36, 36);
+      this.add('mid', 'roadDrift', this.ribbonX(z, dr.range(0.35, 0.9), ROAD_W0 + 0.4, ROAD_W0 + dr.range(2.5, 6.5), 0.010, 651 + i, {
+        wander: 0.3, breathe: 0.6, step: 1.0, relief: 0.002,
+      }));
+    }
+  }
+
+  /**
    * Ground is layered by height, not by draw order: sand sits 6cm below the
    * road, dirt 1cm above it, paving 2cm. Each layer's undulation amplitude is
    * smaller than the gap to the layer above, which is what keeps a hand-placed
@@ -500,6 +701,7 @@ export class LevelSystem implements System {
     // kerb and wall base is a per-vertex term, and a 1.6m grid cannot resolve a
     // 40cm dark line. Ground triangles are the cheapest in the map.
     this.add('mid', 'road', this.groundGrid(ROAD_W0, -41, ROAD_W1, 41, 0, 0.85, 2, 0.012));
+    this.roadSurfacing();
     this.collider.addBox('concrete', {
       cx: (ROAD_W0 + ROAD_W1) * 0.5, cy: -0.18, cz: 0, sx: ROAD_W1 - ROAD_W0, sy: 0.36, sz: 82,
     });
@@ -2744,11 +2946,23 @@ export class LevelSystem implements System {
         }
       }
 
-      // Aerial perspective on the standing geometry. The perimeter ring and the
-      // end blocks are 40-55m out; without a chroma lift they render at the
-      // same contrast as the wall two metres from the muzzle and the frame has
-      // no depth in it at all.
-      paintAerial(geo, 0, 0, 20, 92, 0x9fb2c6, 0.42);
+      // Baked distance tint on the standing geometry.
+      //
+      // This was a 42% lerp of *albedo* toward a constant pale blue-grey, and
+      // it is half of why the distant block, the tower and the market all
+      // arrived at the same value as the sky. Aerial perspective is a property
+      // of the air between the camera and the surface — it belongs to the view
+      // ray, it is evaluated per pixel against the sky in that direction, and
+      // the composite already does exactly that. Baking a second, weaker,
+      // *constant-coloured* copy of it into the material underneath merely
+      // guarantees the two disagree, and the one that cannot see the view
+      // direction wins on the wall it is painted on.
+      //
+      // What survives here is only the part that genuinely is a material
+      // property: sixty years of airborne dust settling on everything that is
+      // never washed, which greys a distant facade without lifting it, and is
+      // therefore neutral and half the strength. The colour push is gone.
+      paintAerial(geo, 0, 0, 26, 96, 0x8b877e, 0.2);
 
       if (!vault.triplanarEnabled) worldPlanarUv(geo, def.tiles);
       geo.computeBoundingSphere();
@@ -2762,6 +2976,8 @@ export class LevelSystem implements System {
         emissive: def.emissive,
         emissiveIntensity: def.emissiveIntensity,
         side: def.side,
+        envMapIntensity: def.envMapIntensity,
+        normalScale: def.normalScale,
         triplanar: def.tiles,
       });
 
@@ -2774,7 +2990,9 @@ export class LevelSystem implements System {
       // anything, and both are large. Keeping them out of the depth passes is
       // free performance with no visible consequence.
       const zone = bucket.key.slice(0, bucket.key.indexOf('/'));
-      const isFloor = bucket.mat === 'sand' || bucket.mat === 'road' || bucket.mat === 'dirt';
+      const isFloor =
+        bucket.mat === 'sand' || bucket.mat === 'road' || bucket.mat === 'dirt' ||
+        bucket.mat === 'roadWear' || bucket.mat === 'roadTar' || bucket.mat === 'roadDrift';
       mesh.castShadow =
         def.look !== 'glass_dirty' &&
         bucket.mat !== 'interiorDark' &&

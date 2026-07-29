@@ -469,7 +469,17 @@ export class RenderPipeline implements RenderSystem {
       uFogHeightFalloff: { value: 0.1 },
       uFogBaseHeight: { value: -1.0 },
       uFogStart: { value: 17 },
-      uFogDesaturate: { value: 0.4 },
+      uFogDesaturate: { value: 0.42 },
+      // Saturation retained at any distance. Aerial perspective desaturates; it
+      // does not bleach, and at zero the far end of the street stopped being
+      // made of anything.
+      uFogSatFloor: { value: 0.6 },
+      // Fraction of a surface's *local* contrast that survives full haze. Air
+      // attenuates detail as a ratio, so a 4:1 window reveal at ninety metres
+      // is still a legible reveal; substituting 86% of the pixel makes it 1.02:1
+      // and the building becomes a cutout.
+      uFogDetailKeep: { value: 0.45 },
+      uInvFullRes: { value: new THREE.Vector2() },
       ...skyUniformBlock(),
     });
 
@@ -1065,6 +1075,7 @@ export class RenderPipeline implements RenderSystem {
 
     // --- 6. Composite ------------------------------------------------------
     this.updateCompositeUniforms(camera, ctx, sky, aoOn, ssrOn, volumeOn);
+    (this.mComposite.uniforms.uInvFullRes.value as THREE.Vector2).set(1 / w, 1 / h);
     this.mComposite.uniforms.tScene.value = scene.texture;
     this.mComposite.uniforms.tDepth.value = scene.depthTexture;
     this.mComposite.uniforms.tAo.value = aoOn ? this.aoRT!.texture : null;

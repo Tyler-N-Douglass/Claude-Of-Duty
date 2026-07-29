@@ -64,8 +64,39 @@ const BOUNCE_FRACTION = 0.145;
  * let another pass pull the warm cast out of `sunColor`, and the gun follows
  * instead of fighting it.
  */
-const VIEW_KEY_FRACTION = 0.62;
-const VIEW_RIM_FRACTION = 0.17;
+/**
+ * The key was 0.62 and that is what lost the last round.
+ *
+ * The reasoning behind 0.62 was sound and the result was not: perpendicular
+ * faces did separate by over a stop, but they separated *around a mid-tone*.
+ * A weapon is a black-polymer and parkerised-steel object; against sunlit
+ * plaster at 0.75 it is supposed to sit near the bottom of the frame's range
+ * and supply its dark mass. Keyed at 0.62 of a 9.2 sun the receiver flank
+ * measured 0.15-0.35 and the whole gun read as unpainted tan resin — a lit
+ * object rather than a silhouetted one with highlights on it.
+ *
+ * The separation therefore has to be bought with *direction* instead. The key
+ * is a quarter of what it was; what replaces it is a hard elevation floor and a
+ * hard lateral floor (below), which together guarantee the key always rakes
+ * across the weapon from high on the left rather than washing it from the
+ * front, plus a rim that is now allowed to exceed the key. Raking light on a
+ * dark object is what makes form: the top plane picks up the key, the near
+ * flank falls two stops off it, and the chamfers between them carry the
+ * specular. Intensity does the opposite — it fills the fall-off in.
+ */
+const VIEW_KEY_FRACTION = 0.155;
+/**
+ * The rim now outweighs the key, which is unusual and correct here.
+ *
+ * On a dark object seen against a bright background the separating edge is the
+ * whole read. This term is skylight wrapping the top and outboard edges from
+ * ahead; because it arrives at a grazing angle to every large face it barely
+ * lifts them, while on the chamfers it lands square and draws the line that
+ * keeps the receiver's spine off the sky behind it. Roles in the rig were
+ * assigned once at construction from the intensities the weapon system
+ * authored, so re-ordering them here does not reshuffle which light is which.
+ */
+const VIEW_RIM_FRACTION = 0.235;
 /**
  * The bounce and the sky ambient split the fill budget, and how they split it
  * is the weapon's contribution to the frame's colour balance. Weighted toward
@@ -74,8 +105,16 @@ const VIEW_RIM_FRACTION = 0.17;
  * key. Most of that budget now sits on the cool side, which is also what a
  * shadowed surface outdoors actually sees.
  */
-const VIEW_FILL_FRACTION = 0.036;
-const VIEW_AMBIENT_FRACTION = 0.060;
+const VIEW_FILL_FRACTION = 0.028;
+/**
+ * The sky ambient is the one term that reaches every face of the weapon at
+ * once, which makes it the one term that can undo everything the raking key is
+ * for. At 0.060 it was putting a floor under the shadow side high enough that
+ * the fall-off off the top plane never got anywhere; 0.040 keeps the darks off
+ * pure black — they still read blue-grey rather than as holes — without paying
+ * for it in modelling.
+ */
+const VIEW_AMBIENT_FRACTION = 0.040;
 /**
  * How far the viewmodel key is allowed to swing onto the real sun bearing.
  *
@@ -92,7 +131,21 @@ const VIEW_KEY_SUN_BLEND = 0.48;
  * faces ninety degrees apart before the rim and the sky have said anything,
  * which is the difference between a shape and a sticker.
  */
-const KEY_MIN_LATERAL = 0.36;
+const KEY_MIN_LATERAL = 0.54;
+/**
+ * Floor on how high the key must sit above the weapon, in camera space.
+ *
+ * This is the term that replaces the intensity that was taken out. A key of any
+ * strength produces form only if the surfaces it rakes across and the surfaces
+ * it misses are different surfaces, and on a weapon held level those are the
+ * top planes and the flanks. Blending toward a sun that is 12 degrees up flattens
+ * the key onto the horizontal, at which point top and side see nearly the same
+ * light and the only thing separating them is albedo — which on a monochrome
+ * black gun is nothing. Holding the elevation at 0.62 (32 degrees minimum above
+ * the bore) guarantees the rail, the top of the receiver and the upper chamfers
+ * always sit a stop and a half over the flanks no matter where the player looks.
+ */
+const KEY_MIN_ELEVATION = 0.62;
 /**
  * Floor on how much of the key must arrive from the *viewer's* side of the
  * weapon, in camera space where +Z points back at the eye.
@@ -585,6 +638,11 @@ export class LightingSystem implements System {
     // floor on z.
     if (_viewLocal.x > -KEY_MIN_LATERAL) _viewLocal.x = -KEY_MIN_LATERAL;
     if (_viewLocal.z < KEY_MIN_FRONTAL) _viewLocal.z = KEY_MIN_FRONTAL;
+    // Elevation: +Y is up, so the floor on how high the key sits is a floor on
+    // y. Without it the sun blend flattens the key onto the horizontal and the
+    // top planes and the flanks see the same light — which on a monochrome
+    // black gun leaves nothing to separate them.
+    if (_viewLocal.y < KEY_MIN_ELEVATION) _viewLocal.y = KEY_MIN_ELEVATION;
     _viewDir.copy(_viewLocal).normalize().applyQuaternion(_camQuat);
     this.aimViewLight(key, _viewDir);
     // The sun's own hue, pulled a quarter of the way to white. A phosphated

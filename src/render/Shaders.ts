@@ -124,9 +124,20 @@ const vec3 ATM_MIE_CONST = vec3( 1.8399918514433978e14, 2.7798023919660528e14, 4
  * changes hue and nothing else: no exposure shift, no change to the glare
  * fraction. It runs inside atmosphereRadiance so the dome, the aerial
  * perspective, the SSR fallback and the CPU-side fog colour cannot disagree.
+ *
+ * At 0.60 this stopped being dust and became paper. Sixty percent of the dome's
+ * chroma is most of it, and what reached the frame was a single pale band with
+ * cumulus the same value as the blue behind them — the sky had no colour to
+ * lose and the clouds had no shadow side. The R/B spread it was hired to close
+ * is real, but it is a *horizon* problem: the anti-solar zenith is the only
+ * direction clean-air Preetham gets badly wrong at this sun elevation, and the
+ * pull only needs to be strong enough to stop that one region running twelve to
+ * one. Held to 0.38, with a slightly warmer floor to hold the balance it was
+ * bought for, the zenith keeps a saturated deep blue and the frame keeps a
+ * colour to grade against.
  */
-const float ATM_DUST = 0.60;
-const vec3 ATM_DUST_TINT = vec3( 1.075, 1.0, 0.925 );
+const float ATM_DUST = 0.38;
+const vec3 ATM_DUST_TINT = vec3( 1.105, 1.0, 0.895 );
 
 float atmRayleighPhase( float c ) { return ( 3.0 / ( 16.0 * PST_PI ) ) * ( 1.0 + c * c ); }
 
@@ -858,6 +869,9 @@ uniform float uFogHeightFalloff;
 uniform float uFogBaseHeight;
 uniform float uFogStart;
 uniform float uFogDesaturate;
+uniform float uFogSatFloor;
+uniform float uFogDetailKeep;
+uniform vec2 uInvFullRes;
 
 // GTAO multi-bounce: occlusion on a coloured albedo should not go neutral grey.
 vec3 multiBounce( float ao, vec3 albedo ) {
@@ -923,6 +937,29 @@ void main() {
     // seventh of the surface's own value to separate a void from a solid.
     float aer = min( fog, 0.86 );
 
+    // Depth weighting, and this is what keeps a window reveal a window reveal.
+    //
+    // A recessed opening is a metre deeper than the wall it is cut into, but
+    // that metre is nothing against ninety, so a haze term driven by distance
+    // alone applies the *same* 86% to the reveal as to the plaster around it —
+    // and 14% of a value difference is not a value difference. Real air does
+    // not behave that way either: the sky fills a ray in proportion to how much
+    // of the ray it can see, and a deep soffit is looking at a fraction of the
+    // dome. So the haze is scaled down where the pixel is markedly darker than
+    // its surroundings, which is exactly the set of pixels that are holes.
+    // The measurement is one bilinear tap at a wide offset — cheap, and it only
+    // has to resolve "is this a hole" and not the shape of the hole.
+    vec3 wide =
+      texture2D( tScene, vUv + vec2(  6.0,  0.0 ) * uInvFullRes ).rgb +
+      texture2D( tScene, vUv + vec2( -6.0,  0.0 ) * uInvFullRes ).rgb +
+      texture2D( tScene, vUv + vec2(  0.0,  6.0 ) * uInvFullRes ).rgb +
+      texture2D( tScene, vUv + vec2(  0.0, -6.0 ) * uInvFullRes ).rgb;
+    wide *= 0.25;
+    float lHere = lumaOf( color );
+    float lWide = lumaOf( wide );
+    float recess = sat( ( lWide - lHere ) / max( 1e-3, lWide + lHere ) );
+    aer *= 1.0 - 0.55 * recess * recess;
+
     // Below a percent of haze the analytic sky evaluation cannot change the
     // pixel by a code value, and most of a street frame is inside that. Worth
     // the branch: two Preetham evaluations at full resolution are not free.
@@ -941,18 +978,43 @@ void main() {
       // first because the contrast term below needs its luminance.
       vec3 air = skyInDirection( rd );
 
+      // Desaturation, with a floor.
+      //
+      // Aerial perspective desaturates; it does not bleach. Uncapped, this term
+      // reached 34% and then handed what was left to an 86% substitution, so a
+      // facade at ninety metres arrived with 9% of its own chroma — which is
+      // white. Floored so that no distance can take more than 40% of the
+      // surface's saturation, the far end of the street keeps enough of the
+      // difference between ochre render and grey concrete to read as two
+      // materials instead of one silhouette.
       float ls = lumaOf( color );
-      color = mix( color, vec3( ls ), aer * uFogDesaturate );
-      // Contrast compression toward the *air's* own luminance, not toward a
-      // constant. The old form pulled 35% of the way to 0.5 of scene radiance,
-      // which is four or five times anything in a shaded street: distance was
-      // adding brightness rather than substituting it, so every far surface
-      // arrived at the tone curve already lifted and the shoulder then flattened
-      // the lot to cream. Aerial perspective desaturates and flattens toward the
-      // sky; it does not glow.
-      color = mix( color, vec3( mix( ls, lumaOf( air ), 0.5 ) ), aer * 0.30 );
+      float desat = min( aer * uFogDesaturate, 1.0 - uFogSatFloor );
+      color = mix( color, vec3( ls ), desat );
 
-      color = mix( color, air, aer );
+      // Distance is a *contrast* term, not a brightness term. This compresses
+      // toward the air's own luminance — so a far building settles onto the
+      // value of the sky behind it rather than climbing past it — and the
+      // approach is deliberately faster than the colour substitution below,
+      // because scattering takes a surface's light out of the ray before it
+      // fills the ray back up.
+      color = mix( color, vec3( mix( ls, lumaOf( air ), 0.5 ) ), aer * 0.34 );
+
+      // The substitution itself, and it is applied to the *low frequencies*.
+      //
+      // Mixing 86% of a smooth function over a whole facade is a low-pass
+      // filter with extra steps: the window reveals, the string courses and the
+      // spall patches all go with it, and what is left is a pale cutout with a
+      // silhouette and nothing inside it. Air does attenuate detail, but it
+      // attenuates it as a *ratio* — a 4:1 reveal at ninety metres is still
+      // maybe 1.6:1, not 1.02:1 — so the haze goes onto the local mean and the
+      // deviation from that mean is kept at a floor. Same integral, same colour,
+      // same horizon: the far wall still fades into the pixel above it. It just
+      // still has a wall's worth of information in it when it gets there.
+      vec3 base = mix( color, wide, 0.5 );
+      // Clamped so a silhouette against the sky — where the wide tap is mostly
+      // sky and the deviation is therefore enormous — cannot ring.
+      vec3 detail = clamp( color - base, -abs( base ) * 0.8, abs( base ) * 1.6 + 0.02 );
+      color = mix( base, air, aer ) + detail * ( 1.0 - aer * ( 1.0 - uFogDetailKeep ) );
     }
   }
 
