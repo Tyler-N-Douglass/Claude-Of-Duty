@@ -6,3 +6,6 @@ qa/shots/
 # Scratch validation scripts agents write while checking their own work.
 .*check.mjs
 .DS_Store
+
+# Generated blind-comparison pairs (regenerate with qa/blind.mjs).
+qa/blind/
