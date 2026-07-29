@@ -98,17 +98,24 @@ interface LookDefaults {
   };
 }
 
-/** Walls: strong ground contact, real sun bleaching, strong macro break-up. */
-const WALL_GRADE: GradeSettings = { contact: 0.85, contactHeight: 1.5, bleach: 0.50, macro: 0.24, iblSpecular: 0.45 };
+// The three grades below were authored across two rounds against a shader that
+// was not running (see triplanarMaterial). Now that they reach the frame, the
+// contact and bleach terms are pulled well back from their paper values: they
+// were tuned by eye against screenshots where they had no effect, which makes
+// every one of those numbers a guess. The macro term is the exception — it is
+// the one this round actually needs, and it is the one that goes up.
+
+/** Walls: ground contact, sun bleaching, and the strongest macro break-up. */
+const WALL_GRADE: GradeSettings = { contact: 0.55, contactHeight: 1.5, bleach: 0.28, macro: 0.32, iblSpecular: 0.45 };
 /** Props and street furniture: they need grounding, they do not need bleaching. */
-const PROP_GRADE: GradeSettings = { contact: 0.60, contactHeight: 0.9, bleach: 0.0, macro: 0.16, iblSpecular: 0.75 };
+const PROP_GRADE: GradeSettings = { contact: 0.42, contactHeight: 0.9, bleach: 0.0, macro: 0.20, iblSpecular: 0.80 };
 /**
  * Ground planes. `contact` is gated by how far a face is from horizontal, so a
  * road takes almost none of it and only kerbs, steps and the sides of things
  * pick it up — but the macro term still matters, because a floor is the largest
  * uninterrupted run of one texture in the frame.
  */
-const FLOOR_GRADE: GradeSettings = { contact: 0.35, contactHeight: 0.7, bleach: 0.0, macro: 0.22, iblSpecular: 0.34 };
+const FLOOR_GRADE: GradeSettings = { contact: 0.28, contactHeight: 0.7, bleach: 0.0, macro: 0.26, iblSpecular: 0.42 };
 
 const DEFAULTS: Record<SurfaceLook, LookDefaults> = {
   concrete_wall: { repeat: 1, normalScale: 1.0, aoIntensity: 1.05, envMapIntensity: 0.9, minSize: 512, grade: WALL_GRADE },
@@ -120,7 +127,7 @@ const DEFAULTS: Record<SurfaceLook, LookDefaults> = {
   // away the road's only fill light and left it crushed black in shadow.
   asphalt: {
     repeat: 1, normalScale: 0.95, aoIntensity: 1.1, envMapIntensity: 0.95, minSize: 512,
-    grade: { contact: 0.35, contactHeight: 0.7, bleach: 0.0, macro: 0.22, iblSpecular: 0.15 },
+    grade: { contact: 0.28, contactHeight: 0.7, bleach: 0.0, macro: 0.26, iblSpecular: 0.30 },
   },
   brick: { repeat: 1, normalScale: 1.1, aoIntensity: 1.15, envMapIntensity: 0.85, minSize: 512, grade: WALL_GRADE },
   plaster_painted: { repeat: 1, normalScale: 0.85, aoIntensity: 1.0, envMapIntensity: 0.85, minSize: 512, grade: WALL_GRADE },
@@ -135,10 +142,19 @@ const DEFAULTS: Record<SurfaceLook, LookDefaults> = {
   sand: { repeat: 1, normalScale: 0.9, aoIntensity: 0.85, envMapIntensity: 0.95, minSize: 512, grade: FLOOR_GRADE },
   dirt_gravel: { repeat: 1, normalScale: 1.1, aoIntensity: 1.15, envMapIntensity: 0.9, minSize: 512, grade: FLOOR_GRADE },
   rubble: { repeat: 1, normalScale: 1.2, aoIntensity: 1.25, envMapIntensity: 0.9, minSize: 512, grade: FLOOR_GRADE },
+  // The last horizontal surface still handing whole pixels to the sky. A glazed
+  // tile IS glossy, so the roughness map keeps a per-tile 0.34..0.56 glaze — but
+  // a floor of them under a clear sky returns the sky's specular lobe almost
+  // unattenuated, and a clear-sky lobe is cyan. Seen end-on through a doorway
+  // that came back as a bright cyan-and-white chequer over a perfect grid: the
+  // most recognisable broken-build pattern there is, arrived at honestly. The
+  // clearcoat was a second, uncapped reflection of the same sky on top, so it
+  // goes down to a trace, and the specular-only knob goes below the other
+  // floors' — this is the one surface that cannot afford it.
   tile_floor: {
-    // The plaza was a half-mirror of the sky. A dusty paved square is not.
-    repeat: 1, normalScale: 0.95, aoIntensity: 1.1, envMapIntensity: 0.95, minSize: 512, grade: FLOOR_GRADE,
-    physical: { clearcoat: 0.16, clearcoatRoughness: 0.45 },
+    repeat: 1, normalScale: 0.95, aoIntensity: 1.1, envMapIntensity: 0.95, minSize: 512,
+    grade: { contact: 0.28, contactHeight: 0.7, bleach: 0.0, macro: 0.28, iblSpecular: 0.26 },
+    physical: { clearcoat: 0.05, clearcoatRoughness: 0.62 },
   },
   glass_dirty: {
     repeat: 1, normalScale: 0.5, aoIntensity: 0.4, envMapIntensity: 1.6, minSize: 512,
@@ -169,6 +185,25 @@ const PALETTE_LOOKS: ReadonlySet<SurfaceLook> = new Set<SurfaceLook>([
   'tile_floor', 'rubble', 'sand', 'dirt_gravel', 'fabric_canvas',
 ]);
 
+/**
+ * Multiplier on the triplanar tiles-per-metre the level asks for.
+ *
+ * The level authors wall looks at ~0.43 tiles/m, a 2.3 m period, which is
+ * eleven to thirteen repeats across the 30 m facade on the right of the hero
+ * shot — high enough that the eye locks onto the period even before it finds
+ * anything inside the tile to lock onto. Stretching the wall looks to a 2.8 m
+ * period takes that to nine, which together with the tiles no longer carrying
+ * any metre-scale form of their own is what breaks the read.
+ *
+ * It is only ever applied to looks whose content has no real-world size. Brick
+ * courses, corrugation pitch and plank widths all do, so they are absent here
+ * and stay exactly where the level put them.
+ */
+const TRI_STRETCH: Partial<Record<SurfaceLook, number>> = {
+  concrete_wall: 0.82,
+  plaster_painted: 0.82,
+};
+
 const _hsl = { h: 0, s: 0, l: 0 };
 
 /**
@@ -190,6 +225,41 @@ function gradeTint(color: THREE.ColorRepresentation, out: THREE.Color): THREE.Co
   const warm = h < 0.5 ? Math.min(Math.max(h, 0.044), 0.119) : 0.086;
   const hue = (h + (warm - h) * 0.88 + 1) % 1;
   out.setHSL(hue, Math.min(_hsl.s, 0.135) * 0.82, _hsl.l, THREE.SRGBColorSpace);
+  return liftTintValue(out);
+}
+
+/**
+ * Stops an architectural tint acting as a dimmer.
+ *
+ * `color` multiplies the albedo map in linear space, and the maps are already
+ * authored at each material's real reflectance — concrete at 0.35, render at
+ * 0.47. A tint like 0xa9a49a is 0.39 linear, so asking for "grey-brown
+ * concrete" was quietly multiplying 0.35 by 0.39 and shipping a 0.14 wall: the
+ * reflectance of weathered asphalt, on a building. Do that to every surface in
+ * the frame and you get a flat cool mid-dark mush with a mean pixel in the
+ * fifties, which is exactly what the critics measured.
+ *
+ * The fix is to keep what the tint was for — hue, chroma, and the *ordering* of
+ * one building against the next — and give back most of the value it was
+ * costing. Luminance is pulled halfway to 1.0, so a 0.39 tint becomes 0.70 and
+ * a 0.60 tint becomes 0.80: the difference between the two survives, at about
+ * half its former strength, and concrete lands back on 0.25 linear where it
+ * belongs.
+ *
+ * Two guards. Anything genuinely dark was chosen to be dark — `interiorDark`
+ * exists to make a window read as depth rather than as a hole — so the lift
+ * ramps in over 0.14..0.30 and leaves those alone. And the result is capped at
+ * 1.0, because this may only ever give back reflectance the tint took away, not
+ * invent any: the exposure and the tonemap are somebody else's lever, and an
+ * albedo pushed past physical would multiply with theirs and blow out.
+ */
+function liftTintValue(out: THREE.Color): THREE.Color {
+  const lum = 0.2126 * out.r + 0.7152 * out.g + 0.0722 * out.b;   // linear
+  if (lum <= 1e-4) return out;
+  const ramp = THREE.MathUtils.smoothstep(lum, 0.14, 0.30);
+  const target = lum + (1 - lum) * 0.55 * ramp;
+  const gain = Math.min(target / lum, 1 / Math.max(out.r, out.g, out.b, 1e-4));
+  out.multiplyScalar(gain);
   return out;
 }
 
@@ -262,6 +332,8 @@ const WORLD_VERT = /* glsl */ `
 `;
 
 const MACRO_NOISE = /* glsl */ `
+uniform vec3 uMacroOffset;
+
 float codMacroHash( vec2 p ) {
   return fract( sin( dot( floor( p ), vec2( 127.1, 311.7 ) ) ) * 43758.5453123 );
 }
@@ -275,12 +347,35 @@ float codMacroNoise( vec2 p ) {
     f.y
   );
 }
+
+/**
+ * The only thing in the renderer that operates at a scale larger than a texture
+ * tile, and therefore the only thing that can stop one repeating.
+ *
+ * The four terms are at roughly 18 m, 24 m, 6 m and 8 m. Every one of them is
+ * longer than the ~2.8 m period the wall maps tile at, which is the whole
+ * point: a modulation at or below the tile period rides along with the repeat
+ * and makes it *more* visible, not less. Two of the four read the vertical
+ * planes so a facade varies up its height as well as along its length, and the
+ * per-material offset means two buildings never phase-lock even where they
+ * share a look and a seed.
+ *
+ * Mean is 0.5 by construction — the weights sum to one and each lookup is
+ * uniform on 0..1 — so this shifts contrast around without moving any
+ * surface's average reflectance.
+ */
+float codMacroField( vec3 wp ) {
+  vec3 p = wp + uMacroOffset;
+  return codMacroNoise( p.xz * 0.055 ) * 0.34
+       + codMacroNoise( p.yz * 0.041 + 7.3 ) * 0.26
+       + codMacroNoise( p.xz * 0.166 + 21.7 ) * 0.22
+       + codMacroNoise( p.xy * 0.129 + 3.1 ) * 0.18;
+}
 `;
 
 const TRI_COMMON = /* glsl */ `
 uniform float uTriScale;
 uniform float uTriSharp;
-uniform float uMacroScale;
 
 vec3 codTriWeights() {
   vec3 w = pow( abs( normalize( vCodWNor ) ), vec3( uTriSharp ) );
@@ -312,7 +407,7 @@ vec4 codTriSample( sampler2D tex, vec3 w ) {
  *    *larger* than the tile modulates it. Everything else in the frame can be
  *    perfect and visible tiling will still give the engine away.
  *
- * The whole thing is one vec4 uniform, two value-noise lookups and about twenty
+ * The whole thing is one vec4 uniform, four value-noise lookups and about forty
  * ALU. It adds nothing to the draw call or triangle count.
  */
 const GRADE_PARS = /* glsl */ `
@@ -320,10 +415,13 @@ uniform vec4 uGrade;   // x contact, y bleach, z macro, w contact height (metres
 uniform float uIblSpecular;
 `;
 
+/** The one macro evaluation, shared by the triplanar path and the grade path. */
+const WORLD_MACRO = /* glsl */ `
+  float codMacro = codMacroField( vCodWPos );
+`;
+
 /** Computed once, before <map_fragment>, and consumed by three later hooks. */
 const GRADE_SETUP = /* glsl */ `
-  float codMacro = codMacroNoise( vCodWPos.xz * 0.147 ) * 0.62
-                 + codMacroNoise( vCodWPos.yz * 0.061 + 7.3 ) * 0.38;
   float codUpright = 1.0 - abs( normalize( vCodWNor ).y );
   float codNear = 1.0 - smoothstep( 0.0, uGrade.w, max( vCodWPos.y, 0.0 ) );
   float codContact = codNear * codNear * codUpright * uGrade.x * ( 0.62 + 0.38 * codMacro );
@@ -365,29 +463,120 @@ interface Injection {
   tri: number;
   /** World-space grading, or undefined for surfaces that are not in the world. */
   grade?: GradeSettings;
+  /** Offsets the world macro field so two materials never share its pattern. */
+  macroSeed: number;
 }
 
 /**
- * One `onBeforeCompile` for all three injections. They have to share the hook —
- * a material only gets one — and they overlap anyway: triplanar and the world
- * grade both want the world position varying, and both want to be the last
- * thing that touches albedo and roughness.
+ * The injection config, stored on `userData` rather than captured in a closure.
+ *
+ * This is the whole reason the grade reaches the frame at all. `onBeforeCompile`
+ * is an own property when you assign it, and `THREE.Material.copy` does not copy
+ * own properties — it copies a fixed list of fields plus a deep JSON clone of
+ * `userData`. Every surface in the level is a *clone* (MaterialVault clones so
+ * it can set `vertexColors` without mutating the shared library object), so an
+ * assigned hook was being dropped on the floor for every wall, floor and prop on
+ * the map. On the low preset, which is what the QA capture runs, nothing put it
+ * back either, and the entire world-space grade has been dead code in every
+ * frame the critics have ever looked at.
+ *
+ * Keeping the config in `userData` and the hook on the prototype (see
+ * CodStandardMaterial below) makes the whole thing survive `clone()` with no
+ * cooperation required from the caller.
  */
-function applyInjection(mat: THREE.MeshStandardMaterial, inj: Injection): void {
-  const { repeat, tri, grade } = inj;
-  const needsWorld = tri > 0 || grade !== undefined;
-  if (repeat === 1 && !needsWorld) return;
+interface CodShaderConfig {
+  repeat: number;
+  tri: number;
+  grade: GradeSettings | null;
+  macroSeed: number;
+  packed: boolean;
+}
 
+interface CodUserData {
+  cod?: CodShaderConfig;
+  codLook?: SurfaceLook;
+  codSeed?: number;
+  codGrade?: GradeSettings | null;
+}
+
+function codConfigure(mat: THREE.MeshStandardMaterial, inj: Injection): void {
   const packed =
-    tri > 0 &&
+    inj.tri > 0 &&
     mat.roughnessMap !== null &&
     mat.roughnessMap === mat.metalnessMap &&
     mat.roughnessMap === mat.aoMap;
+  (mat.userData as CodUserData).cod = {
+    repeat: inj.repeat,
+    tri: inj.tri,
+    grade: inj.grade ?? null,
+    macroSeed: inj.macroSeed,
+    packed,
+  };
+  mat.needsUpdate = true;
+}
+
+/** Program cache key. A prototype method, so it too survives `clone()`. */
+function codCacheKey(this: THREE.Material): string {
+  const c = (this.userData as CodUserData).cod;
+  if (!c) return '';
+  return `cod|${c.repeat !== 1 ? 'u' : ''}${c.tri > 0 ? (c.packed ? 'T' : 't') : ''}${c.grade ? 'g' : ''}`;
+}
+
+function codBeforeCompile(this: THREE.Material, shader: THREE.WebGLProgramParametersWithUniforms): void {
+  const c = (this.userData as CodUserData).cod;
+  if (c) applyInjection(shader, c);
+}
+
+/**
+ * The two material classes the library hands out. They exist only to carry
+ * `onBeforeCompile` and `customProgramCacheKey` on a *prototype*, which is the
+ * one place `clone()` cannot lose them.
+ */
+// Method shorthand, deliberately: a class *field* (`onBeforeCompile = fn`) would
+// create an own property on every instance and be dropped by `copy()` exactly
+// like the assignment it replaces. These have to live on the prototype.
+class CodStandardMaterial extends THREE.MeshStandardMaterial {
+  onBeforeCompile(shader: THREE.WebGLProgramParametersWithUniforms): void {
+    codBeforeCompile.call(this, shader);
+  }
+  customProgramCacheKey(): string {
+    return codCacheKey.call(this);
+  }
+}
+
+class CodPhysicalMaterial extends THREE.MeshPhysicalMaterial {
+  onBeforeCompile(shader: THREE.WebGLProgramParametersWithUniforms): void {
+    codBeforeCompile.call(this, shader);
+  }
+  customProgramCacheKey(): string {
+    return codCacheKey.call(this);
+  }
+}
+
+/**
+ * One `onBeforeCompile` body for all three injections. They have to share the
+ * hook — a material only gets one — and they overlap anyway: triplanar and the
+ * world grade both want the world position varying, and both want to be the
+ * last thing that touches albedo and roughness.
+ */
+function applyInjection(shader: THREE.WebGLProgramParametersWithUniforms, inj: CodShaderConfig): void {
+  const { repeat, tri, packed } = inj;
+  const grade = inj.grade ?? undefined;
+  const needsWorld = tri > 0 || grade !== undefined;
+  if (repeat === 1 && !needsWorld) return;
 
   const uUvScale = { value: new THREE.Vector2(repeat, repeat) };
   const uTriScale = { value: tri };
   const uTriSharp = { value: 5.0 };
-  const uMacroScale = { value: tri / 11 };
+  // Decorrelates the world macro field per material, so two buildings that share
+  // a look and a seed still never phase-lock into the same pattern of patches.
+  const uMacroOffset = {
+    value: new THREE.Vector3(
+      (inj.macroSeed * 0.6180339887 % 1) * 260 - 130,
+      (inj.macroSeed * 0.3819660113 % 1) * 90 - 45,
+      (inj.macroSeed * 0.2360679775 % 1) * 260 - 130,
+    ),
+  };
   const uGrade = {
     value: new THREE.Vector4(
       grade ? grade.contact : 0,
@@ -409,16 +598,16 @@ function applyInjection(mat: THREE.MeshStandardMaterial, inj: Injection): void {
   #endif
 `;
 
-  mat.onBeforeCompile = (shader) => {
+  {
     if (repeat !== 1) shader.uniforms.uUvScale = uUvScale;
     if (grade) {
       shader.uniforms.uGrade = uGrade;
       shader.uniforms.uIblSpecular = uIblSpecular;
     }
+    if (needsWorld) shader.uniforms.uMacroOffset = uMacroOffset;
     if (tri > 0) {
       shader.uniforms.uTriScale = uTriScale;
       shader.uniforms.uTriSharp = uTriSharp;
-      shader.uniforms.uMacroScale = uMacroScale;
     }
 
     // ----------------------------------------------------------------- vertex
@@ -448,6 +637,7 @@ function applyInjection(mat: THREE.MeshStandardMaterial, inj: Injection): void {
     // Setup goes at the logdepth hook, the last thing before <map_fragment>;
     // everything downstream reads what it leaves behind.
     const setup = [
+      needsWorld ? WORLD_MACRO : '',
       tri > 0
         ? /* glsl */ `
   vec3 triW = codTriWeights();
@@ -457,8 +647,7 @@ function applyInjection(mat: THREE.MeshStandardMaterial, inj: Injection): void {
   #endif
   vec4 triAO = triORM;
   vec4 triMet = triORM;${extraSamples}
-  float codTriMacro = codMacroNoise( vCodWPos.xz * uMacroScale ) * 0.6
-                    + codMacroNoise( vCodWPos.yz * uMacroScale * 1.73 + 11.3 ) * 0.4;`
+`
         : '',
       grade ? GRADE_SETUP : '',
     ].join('\n');
@@ -468,7 +657,9 @@ function applyInjection(mat: THREE.MeshStandardMaterial, inj: Injection): void {
       tri > 0
         ? /* glsl */ `#ifdef USE_MAP
     vec4 triAlbedo = codTriSample( map, triW );
-    triAlbedo.rgb *= 0.84 + 0.32 * codTriMacro;
+    // The grade path multiplies by the same field again, so these two together
+    // are the break-up: about 0.73x to 1.30x across six to twenty-four metres.
+    triAlbedo.rgb *= 0.88 + 0.24 * codMacro;
     diffuseColor *= triAlbedo;
   #endif`
         : '#include <map_fragment>';
@@ -480,7 +671,7 @@ function applyInjection(mat: THREE.MeshStandardMaterial, inj: Injection): void {
   #ifdef USE_ROUGHNESSMAP
     roughnessFactor *= triORM.g;
   #endif
-  roughnessFactor = clamp( roughnessFactor * ( 1.06 - 0.12 * codTriMacro ), 0.025, 1.0 );`
+  roughnessFactor = clamp( roughnessFactor * ( 1.06 - 0.12 * codMacro ), 0.025, 1.0 );`
         : '#include <roughnessmap_fragment>';
     // Damp masonry is rougher than dry masonry; bleached render is very
     // slightly less so, the loose surface having washed off it years ago.
@@ -542,27 +733,48 @@ function applyInjection(mat: THREE.MeshStandardMaterial, inj: Injection): void {
     frag = frag.replace('#include <aomap_fragment>', `${aoBody}\n${grade ? GRADE_AO : ''}`);
 
     shader.fragmentShader = frag;
-  };
-
-  const key = `cod|${repeat !== 1 ? 'u' : ''}${tri > 0 ? (packed ? 'T' : 't') : ''}${grade ? 'g' : ''}`;
-  mat.customProgramCacheKey = () => key;
-  if (repeat !== 1) mat.userData.uvScale = uUvScale;
-  if (tri > 0) mat.userData.triplanarScale = tri;
-  mat.needsUpdate = true;
+  }
 }
 
 /**
  * World-space triplanar sampling with a whiteout normal blend and a large-scale
  * brightness/roughness variation on top. Without the macro term a triplanar
  * wall still reads as one texture repeated; with it, it reads as a wall.
+ *
+ * `grade` and `macroSeed` fall back to what the library stamped on the base
+ * material, and that fallback is doing real work rather than being a nicety.
+ *
+ * Every surface in the level is built by MaterialVault, which asks the library
+ * for `repeat: 1` — believing that leaves the material on the stock program —
+ * clones it, and then calls this function with a scale and nothing else. Two
+ * things went wrong with that. `Material.copy` does not copy `onBeforeCompile`,
+ * because it is an own property rather than a copied field, so the clone
+ * silently lost the grade the library had installed; and this function then
+ * reinstalled an injection with `grade` undefined, so it never came back.
+ *
+ * The net effect was that ground contact, sun bleaching, the world-space macro
+ * break-up and the specular-only knob were configured, documented, tuned across
+ * two rounds — and running on nothing. `userData` is deep-cloned by
+ * `Material.copy`, so reading them back off it makes the handoff survive
+ * without the caller having to know any of this. On the low preset — which is
+ * what the QA capture uses — the vault never calls this at all, and the
+ * prototype hook on CodStandardMaterial is what saves it there.
  */
 export function triplanarMaterial(
   base: THREE.MeshStandardMaterial,
   scale: number,
   grade?: GradeSettings,
+  macroSeed?: number,
 ): THREE.MeshStandardMaterial {
+  const ud = base.userData as CodUserData;
   const mat = base.clone();
-  applyInjection(mat, { repeat: 1, tri: scale, grade });
+  const look = ud.codLook;
+  codConfigure(mat, {
+    repeat: 1,
+    tri: scale * (look !== undefined ? TRI_STRETCH[look] ?? 1 : 1),
+    grade: grade ?? ud.codGrade ?? undefined,
+    macroSeed: macroSeed ?? ud.codSeed ?? 0,
+  });
   return mat;
 }
 
@@ -649,7 +861,7 @@ export class MaterialLibrary {
     let mat: THREE.MeshStandardMaterial | THREE.MeshPhysicalMaterial;
     if (d.physical) {
       const p = d.physical;
-      const phys = new THREE.MeshPhysicalMaterial(params);
+      const phys = new CodPhysicalMaterial(params);
       if (p.clearcoat !== undefined) phys.clearcoat = p.clearcoat;
       if (p.clearcoatRoughness !== undefined) phys.clearcoatRoughness = p.clearcoatRoughness;
       if (p.sheen !== undefined) phys.sheen = p.sheen;
@@ -662,7 +874,7 @@ export class MaterialLibrary {
       if (p.depthWrite !== undefined) phys.depthWrite = p.depthWrite;
       mat = phys;
     } else {
-      mat = new THREE.MeshStandardMaterial(params);
+      mat = new CodStandardMaterial(params);
     }
 
     mat.normalScale.set(ns, ns);
@@ -671,13 +883,20 @@ export class MaterialLibrary {
       mat.emissiveIntensity = opts.emissiveIntensity ?? 1;
     }
 
+    // Stamped before anything clones this material. userData is the one thing
+    // THREE.Material.copy deep-copies, so it is the only channel through which
+    // the look's grade can reach a clone made somewhere else.
+    mat.userData.codLook = look;
+    mat.userData.codSeed = seed;
+    mat.userData.codGrade = d.grade ?? null;
+
     if (tri > 0) {
-      const t = triplanarMaterial(mat, tri, d.grade);
+      const t = triplanarMaterial(mat, tri, d.grade, seed);
       mat.dispose();
       return t;
     }
 
-    applyInjection(mat, { repeat, tri: 0, grade: d.grade });
+    codConfigure(mat, { repeat, tri: 0, grade: d.grade, macroSeed: seed });
     return mat;
   }
 

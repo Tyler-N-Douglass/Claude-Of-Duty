@@ -2,9 +2,9 @@
  * Shared GLSL for the render pipeline, sky and lighting.
  *
  * Everything here is written against three's ShaderMaterial preamble: the code
- * is authored in GLSL1 style (`varying`, `texture2D`, `gl_FragColor`) which
+ * is authored in GLSL1 style (varying, texture2D, gl_FragColor) which
  * three transparently upgrades to GLSL ES 3.00 on WebGL2, so ES3-only builtins
- * (`textureLod`, `texelFetch`, `textureSize`, `texture(sampler2DShadow, vec3)`)
+ * (textureLod, texelFetch, textureSize, texture(sampler2DShadow, vec3))
  * are also available and used where they matter.
  */
 
@@ -72,21 +72,161 @@ vec3 ycocg2rgb( vec3 c ) {
   return vec3( c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z );
 }
 
-// Cheap analytic stand-in for the sky dome, fed the same colours the sky
-// system computed on the CPU so reflections and fog match the actual dome.
-vec3 skyApprox( vec3 d, vec3 zenith, vec3 horizon, vec3 ground, vec3 sunCol, vec3 sunDir ) {
-  vec3 c = mix( horizon, zenith, pow( sat( d.y ), 0.42 ) );
-  c = mix( ground, c, smoothstep( -0.09, 0.02, d.y ) );
-  float s = sat( dot( d, sunDir ) );
-  c += sunCol * pow( s, 16.0 ) * 0.55;
-  c += sunCol * pow( s, 3.0 ) * 0.06;
-  return c;
-}
-
 float henyeyGreenstein( float cosT, float g ) {
   float g2 = g * g;
   float d = 1.0 + g2 - 2.0 * g * cosT;
   return ( 1.0 - g2 ) / ( 4.0 * PST_PI * max( 1e-4, d * sqrt( max( 1e-4, d ) ) ) );
+}
+`;
+
+// ---------------------------------------------------------------------------
+// The analytic sky, shared by *everything* that needs to know what colour the
+// air is in a given direction
+// ---------------------------------------------------------------------------
+
+/**
+ * One Preetham evaluation, one set of constants, one call site shape.
+ *
+ * The dome, the aerial-perspective term in the composite and the SSR fallback
+ * all call skyDomeRadiance with the same parameters, so it is structurally
+ * impossible for a distant facade to haze toward a colour the sky above it is
+ * not. Previously the composite used a three-colour lerp fitted on the CPU: it
+ * carried the *horizon* colour (sampled across from the sun, and therefore warm
+ * from the long slant path) into every near-horizontal view ray, including the
+ * ones looking at a cool blue quarter of the sky. That is exactly the seam the
+ * far plaza wall was sitting on — cream haze under a blue sky.
+ *
+ * Nothing here is scaled by intensity or rolled; callers do that via
+ * skyDomeRadiance so the roll happens once, at the end, on the whole value.
+ */
+export const ATMOSPHERE_GLSL = /* glsl */ `
+const vec3 ATM_UP = vec3( 0.0, 1.0, 0.0 );
+const vec3 ATM_TOTAL_RAYLEIGH = vec3( 5.804542996261093e-6, 1.3562911419845635e-5, 3.0265902468824876e-5 );
+const vec3 ATM_MIE_CONST = vec3( 1.8399918514433978e14, 2.7798023919660528e14, 4.0790479543861094e14 );
+
+float atmRayleighPhase( float c ) { return ( 3.0 / ( 16.0 * PST_PI ) ) * ( 1.0 + c * c ); }
+
+float atmMiePhase( float c, float g ) {
+  float g2 = g * g;
+  float inv = 1.0 / pow( max( 1e-4, 1.0 - 2.0 * g * c + g2 ), 1.5 );
+  return ( 1.0 / ( 4.0 * PST_PI ) ) * ( ( 1.0 - g2 ) * inv );
+}
+
+float atmSunE( vec3 sunDir ) {
+  return 1000.0 * max( 0.0, 1.0 - exp( -( ( 1.5707963 - acos( clamp( sunDir.y, -1.0, 1.0 ) ) ) / 1.5 ) ) );
+}
+
+/** Extinction along the sun ray from this direction's air mass. */
+vec3 atmExtinction( float zenithAngle, float turbidity, float rayleigh, float mieCoefficient ) {
+  vec3 betaR = ATM_TOTAL_RAYLEIGH * rayleigh;
+  float c = ( 0.2 * turbidity ) * 10.0e-18;
+  vec3 betaM = 0.434 * c * ATM_MIE_CONST * mieCoefficient;
+  float denom = cos( zenithAngle ) + 0.15 * pow( max( 1e-3, 93.885 - ( zenithAngle * 180.0 / PST_PI ) ), -1.253 );
+  float inverse = 1.0 / max( 1e-4, denom );
+  return exp( -( betaR * 8.4e3 * inverse + betaM * 1.25e3 * inverse ) );
+}
+
+/** Diffuse sky radiance in dir. No sun disc, no intensity scale, no roll. */
+vec3 atmosphereRadiance( vec3 dir, vec3 sunDir, float turbidity, float rayleigh, float mieCoefficient, float mieG ) {
+  float sunE = atmSunE( sunDir );
+
+  vec3 betaR = ATM_TOTAL_RAYLEIGH * rayleigh;
+  float c = ( 0.2 * turbidity ) * 10.0e-18;
+  vec3 betaM = 0.434 * c * ATM_MIE_CONST * mieCoefficient;
+
+  float zenithAngle = acos( max( 0.0, dot( ATM_UP, dir ) ) );
+  vec3 Fex = atmExtinction( zenithAngle, turbidity, rayleigh, mieCoefficient );
+
+  float cosTheta = dot( dir, sunDir );
+  vec3 betaRTheta = betaR * atmRayleighPhase( cosTheta * 0.5 + 0.5 );
+  vec3 betaMTheta = betaM * atmMiePhase( cosTheta, mieG );
+
+  vec3 base = ( betaRTheta + betaMTheta ) / ( betaR + betaM );
+  vec3 Lin = pow( sunE * base * ( 1.0 - Fex ), vec3( 1.5 ) );
+  Lin *= mix(
+    vec3( 1.0 ),
+    pow( max( vec3( 0.0 ), sunE * base * Fex ), vec3( 0.5 ) ),
+    sat( pow( 1.0 - dot( ATM_UP, sunDir ), 5.0 ) )
+  );
+
+  return ( Lin + 0.1 * Fex ) * 0.04 + vec3( 0.0, 0.00035, 0.00085 );
+}
+
+/**
+ * Hyperbolic roll for sky radiance.
+ *
+ * The old code did min( sky, 4.0 ). A hard min on the Mie aureole is what
+ * produced a 300-pixel plateau of *identical* cream pixels around the sun: not
+ * a sun, a hole cut in the sky. This leaves everything under knee untouched
+ * and asymptotes to maxV above it, so the aureole always has a gradient in
+ * it and the only thing that can reach the top of the range is the disc.
+ */
+vec3 skyRoll( vec3 x, float knee, float maxV ) {
+  float range = max( 1e-3, maxV - knee );
+  vec3 over = max( vec3( 0.0 ), x - knee );
+  vec3 rolled = knee + range * ( over / ( over + range ) );
+  return mix( x, rolled, step( vec3( knee ), x ) );
+}
+
+/**
+ * The dome as the frame sees it, minus clouds: atmosphere, ground hemisphere,
+ * horizon haze band, rolled. This is the function the aerial perspective fades
+ * into, so by construction it cannot disagree with the background.
+ */
+vec3 skyDomeRadianceH(
+  vec3 dir, vec3 sunDir, float turbidity, float rayleigh, float mieCoefficient, float mieG,
+  float intensity, vec3 groundColor, float rollKnee, float rollMax, out vec3 horizonCol
+) {
+  vec3 sky = atmosphereRadiance( dir, sunDir, turbidity, rayleigh, mieCoefficient, mieG ) * intensity;
+
+  vec3 horizonDir = normalize( vec3( dir.x, 0.02, dir.z ) );
+  horizonCol = atmosphereRadiance( horizonDir, sunDir, turbidity, rayleigh, mieCoefficient, mieG ) * intensity;
+
+  float below = smoothstep( 0.02, -0.10, dir.y );
+  vec3 ground = groundColor * ( 0.35 + 0.65 * sat( sunDir.y ) ) + horizonCol * 0.35;
+  sky = mix( sky, ground, below );
+
+  // Real air never lets the horizon meet the ground clean. Rolled first so the
+  // band cannot smear the aureole across the bottom third of a backlit sky.
+  float hazeBand = exp( -abs( dir.y ) * 9.0 );
+  vec3 haze = skyRoll( horizonCol, rollKnee, rollMax ) * 1.04 + vec3( 0.012, 0.013, 0.015 ) * intensity;
+  sky = mix( sky, mix( sky, haze, 0.5 ) * vec3( 1.04, 1.01, 0.975 ), hazeBand * 0.5 );
+
+  return skyRoll( max( vec3( 0.0 ), sky ), rollKnee, rollMax );
+}
+
+vec3 skyDomeRadiance(
+  vec3 dir, vec3 sunDir, float turbidity, float rayleigh, float mieCoefficient, float mieG,
+  float intensity, vec3 groundColor, float rollKnee, float rollMax
+) {
+  vec3 ignored;
+  return skyDomeRadianceH(
+    dir, sunDir, turbidity, rayleigh, mieCoefficient, mieG, intensity, groundColor,
+    rollKnee, rollMax, ignored
+  );
+}
+`;
+
+/** Uniform block every caller of skyDomeRadiance declares, verbatim. */
+export const SKY_UNIFORMS_GLSL = /* glsl */ `
+uniform vec3 uSunDir;
+uniform float uTurbidity;
+uniform float uRayleigh;
+uniform float uMieCoefficient;
+uniform float uMieG;
+uniform float uSkyIntensity;
+uniform vec3 uGroundColor;
+uniform float uSkyRollKnee;
+uniform float uSkyRollMax;
+`;
+
+/** The call, with the uniforms above already bound. */
+export const SKY_CALL_GLSL = /* glsl */ `
+vec3 skyInDirection( vec3 d ) {
+  return skyDomeRadiance(
+    d, uSunDir, uTurbidity, uRayleigh, uMieCoefficient, uMieG,
+    uSkyIntensity, uGroundColor, uSkyRollKnee, uSkyRollMax
+  );
 }
 `;
 
@@ -398,6 +538,9 @@ void main() {
 export const SSR_FRAG = /* glsl */ `
 varying vec2 vUv;
 ${POST_COMMON}
+${ATMOSPHERE_GLSL}
+${SKY_UNIFORMS_GLSL}
+${SKY_CALL_GLSL}
 
 uniform sampler2D tScene;
 uniform highp sampler2D tDepth;
@@ -410,11 +553,6 @@ uniform float uFrame;
 uniform float uThickness;
 uniform float uMaxDistance;
 uniform float uReflectivity;
-uniform vec3 uSkyZenith;
-uniform vec3 uSkyHorizon;
-uniform vec3 uSkyGround;
-uniform vec3 uSunColor;
-uniform vec3 uSunDir;
 
 float depthAt( vec2 uv ) { return textureLod( tDepth, uv, 0.0 ).x; }
 
@@ -471,7 +609,7 @@ void main() {
   if ( strength <= 0.003 ) { gl_FragColor = vec4( 0.0 ); return; }
 
   vec3 worldR = normalize( mat3( uCamWorld ) * R );
-  vec3 fallback = skyApprox( worldR, uSkyZenith, uSkyHorizon, uSkyGround, uSunColor, uSunDir );
+  vec3 fallback = skyInDirection( worldR );
 
   vec3 hitColor = fallback;
   float hitConfidence = 0.0;
@@ -644,6 +782,9 @@ void main() {
 export const COMPOSITE_FRAG = /* glsl */ `
 varying vec2 vUv;
 ${POST_COMMON}
+${ATMOSPHERE_GLSL}
+${SKY_UNIFORMS_GLSL}
+${SKY_CALL_GLSL}
 
 uniform sampler2D tScene;
 uniform highp sampler2D tDepth;
@@ -663,11 +804,6 @@ uniform float uFogHeightFalloff;
 uniform float uFogBaseHeight;
 uniform float uFogStart;
 uniform float uFogDesaturate;
-uniform vec3 uSkyZenith;
-uniform vec3 uSkyHorizon;
-uniform vec3 uSkyGround;
-uniform vec3 uSunColor;
-uniform vec3 uSunDir;
 
 // GTAO multi-bounce: occlusion on a coloured albedo should not go neutral grey.
 vec3 multiBounce( float ao, vec3 albedo ) {
@@ -728,30 +864,30 @@ void main() {
 
     float aer = min( fog, 0.94 );
 
-    // Contrast and saturation go first, and they go faster than the colour
-    // replacement does. Air scatters a distant facade's own light out of the
-    // ray before it fills the ray back up with sky, so what you see at range is
-    // a *flatter, greyer* version of the surface with the sky laid over it —
-    // not the surface at full chroma under a wash. Doing only the wash is what
-    // makes engine fog look like a coloured sheet of glass.
-    float ls = lumaOf( color );
-    color = mix( color, vec3( ls ), aer * uFogDesaturate );
-    // Contrast toward the local mean as well, so distant value structure
-    // compresses instead of staying razor sharp under a lifted sky.
-    color = mix( color, vec3( mix( ls, 0.5, 0.35 ) ), aer * 0.22 );
+    // Below a percent of haze the analytic sky evaluation cannot change the
+    // pixel by a code value, and most of a street frame is inside that. Worth
+    // the branch: two Preetham evaluations at full resolution are not free.
+    if ( aer > 0.01 ) {
+      // Contrast and saturation go first, and they go faster than the colour
+      // replacement does. Air scatters a distant facade's own light out of the
+      // ray before it fills the ray back up with sky, so what you see at range
+      // is a *flatter, greyer* version of the surface with the sky laid over it
+      // — not the surface at full chroma under a wash. Doing only the wash is
+      // what makes engine fog look like a coloured sheet of glass.
+      float ls = lumaOf( color );
+      color = mix( color, vec3( ls ), aer * uFogDesaturate );
+      // Contrast toward the local mean as well, so distant value structure
+      // compresses instead of staying razor sharp under a lifted sky.
+      color = mix( color, vec3( mix( ls, 0.5, 0.35 ) ), aer * 0.22 );
 
-    // The haze itself is the sky radiance *along this pixel's view ray*, from
-    // the same analytic model that generates the dome and the IBL, so it is
-    // warm where the frame looks toward the sun and cool where it looks away
-    // and it can never disagree with the background it fades into.
-    vec3 air = skyApprox( rd, uSkyZenith, uSkyHorizon, uSkyGround, uSunColor, uSunDir );
-    // Ceiling on the haze. Looking into a low sun the analytic aureole runs to
-    // several times diffuse sky, and letting that into the aerial term turns
-    // every distant facade on the sun side into a white card. Real air does
-    // lift toward the aureole, but a camera exposed for the street does not
-    // resolve it that far above the sky's own diffuse level.
-    air = min( air, vec3( 2.2 ) );
-    color = mix( color, air, aer );
+      // The haze itself is the sky radiance *along this pixel's view ray*, from
+      // the exact function that draws the dome — same Preetham evaluation, same
+      // roll, same horizon band. Not an approximation of it, and not a
+      // CPU-fitted three-colour lerp: the far wall now fades into the pixel
+      // directly above it, whatever colour that pixel happens to be.
+      vec3 air = skyInDirection( rd );
+      color = mix( color, air, aer );
+    }
   }
 
   if ( uVolumeEnabled > 0.5 ) {
@@ -760,6 +896,76 @@ void main() {
 
   // Alpha 0 marks "world"; the viewmodel pass overwrites it with 1.
   gl_FragColor = vec4( color, 0.0 );
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Auto-exposure metering
+// ---------------------------------------------------------------------------
+
+/**
+ * Log-average luminance, folded 1344x756 -> 64x64 -> 8x8 -> 1x1 in three draws.
+ *
+ * Metering runs on the *scene* target, before the viewmodel is composited, so
+ * the gun — which is dark, close and covers a fifth of the frame — cannot drag
+ * the whole world a stop brighter every time the player looks down.
+ *
+ * The result is stored as an 8-bit encoding of log2(luminance) over a 28-stop
+ * window, which quantises to 0.11 stops: below the point at which a change in
+ * exposure is visible, and cheap enough to read back a single texel per frame.
+ */
+export const LUMA_INIT_FRAG = /* glsl */ `
+varying vec2 vUv;
+${POST_COMMON}
+uniform sampler2D tDiffuse;
+uniform highp sampler2D tDepth;
+uniform vec2 uSrcTexel;
+uniform vec2 uBlock;
+uniform float uSkyWeight;
+
+void main() {
+  float s = 0.0;
+  float wsum = 0.0;
+  for ( int y = 0; y < 4; y ++ ) {
+    for ( int x = 0; x < 4; x ++ ) {
+      vec2 o = ( ( vec2( float( x ), float( y ) ) + 0.5 ) * 0.25 - 0.5 ) * uBlock;
+      vec2 uv = vUv + o * uSrcTexel;
+      vec3 c = max( vec3( 0.0 ), textureLod( tDiffuse, uv, 0.0 ).rgb );
+      // The sky is not what the camera is exposing for. A frame that happens to
+      // point up the street into the sun contains three times the sky of one
+      // pointed down it, and metering them equally swings the exposure a stop
+      // and a half between two shots of the same town at the same hour. It
+      // keeps a small weight so a frame that is *only* sky still meters.
+      float w = textureLod( tDepth, uv, 0.0 ).x >= 0.9999995 ? uSkyWeight : 1.0;
+      // Clamped at the top so the sun's disc — four orders of magnitude above
+      // anything else in the frame — cannot swing the whole meter on its own.
+      s += w * log2( clamp( lumaOf( c ), 1e-4, 8.0 ) );
+      wsum += w;
+    }
+  }
+  s /= max( wsum, 1e-4 );
+  gl_FragColor = vec4( ( s + 14.0 ) / 28.0, 0.0, 0.0, 1.0 );
+}
+`;
+
+export const LUMA_DOWN_FRAG = /* glsl */ `
+varying vec2 vUv;
+uniform sampler2D tDiffuse;
+uniform vec2 uSrcTexel;
+uniform vec2 uBlock;
+
+void main() {
+  // 4x4 bilinear taps on texel boundaries: each tap is the mean of four texels,
+  // so a block of 8x8 source texels is covered exactly once with no gaps and no
+  // double counting.
+  float s = 0.0;
+  for ( int y = 0; y < 4; y ++ ) {
+    for ( int x = 0; x < 4; x ++ ) {
+      vec2 o = ( ( vec2( float( x ), float( y ) ) + 0.5 ) * 0.25 - 0.5 ) * uBlock;
+      s += textureLod( tDiffuse, vUv + o * uSrcTexel, 0.0 ).r;
+    }
+  }
+  gl_FragColor = vec4( s / 16.0, 0.0, 0.0, 1.0 );
 }
 `;
 
@@ -1079,7 +1285,9 @@ uniform vec3 uHighlightTint;
 uniform float uSaturation;
 uniform float uContrast;
 uniform float uToe;
+uniform float uToeKnee;
 uniform float uShoulder;
+uniform float uWhitePoint;
 
 // Full ACES RRT+ODT fit (Stephen Hill), not the Narkowicz approximation:
 // the input/output matrices are what give ACES its highlight hue rotation.
@@ -1119,6 +1327,12 @@ vec3 acesFitted( vec3 c ) {
  *    roll — it traded both for a slightly steeper middle.
  *  - a toe: extra density in the bottom couple of stops, on a smoothstep so it
  *    fades out rather than banding. This is what puts a real black in the frame.
+ *    Its knee is an explicit parameter and it belongs *low*: at the old hard
+ *    coded 0.2 the toe was engaging on everything under sRGB 0.48, which in a
+ *    frame whose content sat between sRGB 0.13 and 0.40 meant every pixel. A
+ *    curve that shapes the whole image is not a toe, it is a gamma, and the
+ *    result was a midtone crush that flattened exactly the range the eye reads
+ *    for form. At 0.07 it touches the bottom two stops and nothing else.
  *  - a shoulder: a hyperbolic roll above uShoulder. It leaves the curve with
  *    unit slope exactly at the knee — so there is no visible break where it
  *    engages — and asymptotes to 1.0, so an arbitrarily bright highlight
@@ -1129,16 +1343,23 @@ vec3 acesFitted( vec3 c ) {
  * knee: forcing that endpoint makes the slope above the pivot *greater* than
  * one, which expands the very highlights it is supposed to be compressing.
  */
-vec3 toneShape( vec3 c, float contrast, float toe, float shoulder ) {
+vec3 toneShape( vec3 c, float contrast, float toe, float toeKnee, float shoulder, float white ) {
   vec3 x = max( c, vec3( 0.0 ) );
 
   x = pow( max( x / 0.18, vec3( 1e-5 ) ), vec3( contrast ) ) * 0.18;
 
-  vec3 t = sat3( x / 0.2 );
+  vec3 t = sat3( x / max( 1e-4, toeKnee ) );
   x *= mix( vec3( 1.0 ), t * t * ( 3.0 - 2.0 * t ), toe );
 
   float s = clamp( shoulder, 0.05, 0.95 );
-  float range = 1.0 - s;
+  // The shoulder is normalised so that a chosen white point maps to exactly
+  // 1.0. Without this the curve asymptotes *below* one — ACES tops out near
+  // 1.0165, the contrast power lifts that to about 1.54, and a shoulder whose
+  // asymptote is 1.0 then compresses it to 0.94 no matter how bright the input.
+  // Nothing in the game could reach white: not a window onto full sun, not the
+  // sun itself. A filmic curve has to be told where white is.
+  float w = max( white, 1.0 + ( 1.0 - s ) * 0.02 );
+  float range = ( ( 1.0 - s ) * ( w - s ) ) / max( 1e-3, ( w - s ) - ( 1.0 - s ) );
   vec3 over = max( vec3( 0.0 ), x - s );
   vec3 rolled = s + range * ( over / ( over + range ) );
   x = mix( x, rolled, step( vec3( s ), x ) );
@@ -1151,23 +1372,41 @@ void main() {
   vec3 bloom = texture2D( tBloom, vUv ).rgb;
 
   color = max( vec3( 0.0 ), color * uExposure );
-  // Bloom arrives already exposed from the prefilter.
-  color = mix( color, bloom, sat( uBloomStrength ) );
+  // Bloom arrives already exposed from the prefilter, and is *added* rather
+  // than cross-faded: mix( color, bloom, 0.055 ) quietly took 5.5% off every
+  // pixel in the frame whether or not there was any bloom there to take it for.
+  color += bloom * max( 0.0, uBloomStrength );
 
   color = acesFitted( color );
 
-  color = toneShape( color, uContrast, uToe, uShoulder );
+  color = toneShape( color, uContrast, uToe, uToeKnee, uShoulder, uWhitePoint );
 
   // Lift / gamma / gain.
+  //
+  // uLift is fed 0 and must stay there. The buffer is display-LINEAR at this
+  // point and FINAL_FRAG still has to run linearToSrgb over it, so a lift
+  // authored as an sRGB pedestal lands two and a half stops too high: 0.017
+  // linear encodes to sRGB 0.138, which is why five different frames all
+  // measured a 1st-percentile luminance of 0.133 to three decimals. There was
+  // no black anywhere in the game. The film black now lives in FINAL_FRAG,
+  // after the encode, where a print black is actually specified.
   color = sat3( color * ( uGain - uLift ) + uLift );
   color = pow( max( color, vec3( 1e-5 ) ), uGamma );
 
   // Split tone: cool shadows, warm highlights — the golden-hour signature.
-  float l = lumaOf( color );
-  vec3 shadowW = vec3( 1.0 - smoothstep( 0.0, 0.55, l ) );
-  vec3 highW = vec3( smoothstep( 0.42, 1.0, l ) );
-  color *= mix( vec3( 1.0 ), uShadowTint, shadowW * 0.75 );
-  color *= mix( vec3( 1.0 ), uHighlightTint, highW * 0.7 );
+  //
+  // The luma is taken in an approximately perceptual space. The breakpoints
+  // below were authored against sRGB code values, but color here is
+  // display-linear, and feeding one to the other put content at sRGB 0.34 —
+  // linear 0.095 — at shadowW 0.92 and highW 0.0. That painted 92% of the COOL
+  // tint onto every sunlit surface in the game and never once fired the warm
+  // one, which is why the sunlit half of a facade measured *bluer* than its own
+  // shadow. Two ways to fix it; this is the one that keeps the numbers legible.
+  float l = lumaOf( pow( max( color, vec3( 0.0 ) ), vec3( 1.0 / 2.2 ) ) );
+  vec3 shadowW = vec3( 1.0 - smoothstep( 0.0, 0.84, l ) );
+  vec3 highW = vec3( smoothstep( 0.44, 1.0, l ) );
+  color *= mix( vec3( 1.0 ), uShadowTint, shadowW );
+  color *= mix( vec3( 1.0 ), uHighlightTint, highW * 0.8 );
 
   // Saturation shaping: lift the mids, let the extremes fall off.
   float sl = lumaOf( color );
@@ -1195,13 +1434,26 @@ uniform float uVignette;
 uniform float uGrain;
 uniform float uSharpen;
 uniform float uFxaa;
+uniform float uFilmBlack;
+uniform vec3 uFilmBlackTint;
 
 /**
  * Luma FXAA 3.11, trimmed to the console-quality preset. This is the *only*
  * anti-aliasing when TAA is off — the renderer is created with antialias:false
  * because the frame is composited through render targets, where MSAA does not
  * apply. Without it a low preset ships raw, crawling geometry edges.
+ *
+ * Two things were wrong with the way it was being used. It ran on a *linear*
+ * buffer while its thresholds were authored for gamma-encoded luma, so a
+ * silhouette running sRGB 0.32 -> 0.61 in one pixel presented as a linear step
+ * of 0.09 and slipped under the absolute gate. And the pipeline latched it off
+ * whenever a frame took longer than 45ms — which is every frame on the software
+ * rasteriser the whole review is captured on, so the shipped screenshots had no
+ * anti-aliasing at all. The luma is now taken in perceptual space, on FXAA's
+ * own published thresholds.
  */
+float fxaaLuma( vec3 c ) { return lumaOf( sqrt( max( c, vec3( 0.0 ) ) ) ); }
+
 vec3 fxaaFilter( sampler2D tex, vec2 uv, vec2 texel ) {
   vec3 rgbM = texture2D( tex, uv ).rgb;
   vec3 rgbNW = texture2D( tex, uv + vec2( -1.0, -1.0 ) * texel ).rgb;
@@ -1209,15 +1461,15 @@ vec3 fxaaFilter( sampler2D tex, vec2 uv, vec2 texel ) {
   vec3 rgbSW = texture2D( tex, uv + vec2( -1.0,  1.0 ) * texel ).rgb;
   vec3 rgbSE = texture2D( tex, uv + vec2(  1.0,  1.0 ) * texel ).rgb;
 
-  float lM = lumaOf( rgbM );
-  float lNW = lumaOf( rgbNW );
-  float lNE = lumaOf( rgbNE );
-  float lSW = lumaOf( rgbSW );
-  float lSE = lumaOf( rgbSE );
+  float lM = fxaaLuma( rgbM );
+  float lNW = fxaaLuma( rgbNW );
+  float lNE = fxaaLuma( rgbNE );
+  float lSW = fxaaLuma( rgbSW );
+  float lSE = fxaaLuma( rgbSE );
   float lMin = min( lM, min( min( lNW, lNE ), min( lSW, lSE ) ) );
   float lMax = max( lM, max( max( lNW, lNE ), max( lSW, lSE ) ) );
   // Contrast gate: flat regions are left alone so texture detail survives.
-  if ( lMax - lMin < max( 0.05, lMax * 0.166 ) ) return rgbM;
+  if ( lMax - lMin < max( 0.0312, lMax * 0.125 ) ) return rgbM;
 
   vec2 dir = vec2( -( ( lNW + lNE ) - ( lSW + lSE ) ), ( lNW + lSW ) - ( lNE + lSE ) );
   float reduce = max( ( lNW + lNE + lSW + lSE ) * 0.03125, 0.0078125 );
@@ -1232,7 +1484,7 @@ vec3 fxaaFilter( sampler2D tex, vec2 uv, vec2 texel ) {
     texture2D( tex, uv - dir * 0.5 ).rgb +
     texture2D( tex, uv + dir * 0.5 ).rgb
   );
-  float lB = lumaOf( rgbB );
+  float lB = fxaaLuma( rgbB );
   return ( lB < lMin || lB > lMax ) ? rgbA : rgbB;
 }
 
@@ -1279,6 +1531,15 @@ void main() {
 
   color = linearToSrgb( color );
 
+  // Film black, and it goes *here* — after the display encode, because a print
+  // black is specified as a code value, not as a radiance. sRGB code 3 on a
+  // 0..255 scale, tinted very slightly cool, which is what the base density of
+  // a projection print actually measures. Applied as a range compression rather
+  // than an add, so the top of the scale is untouched and the frame keeps its
+  // white. The whole visible effect is that the darkest pixels stop being
+  // absolute zero; it is 2% of what the old linear lift was doing.
+  color = color * ( 1.0 - uFilmBlack ) + uFilmBlack * uFilmBlackTint;
+
   // Grain scales with darkness: film has more visible grain in the toe.
   float lum = lumaOf( color );
   float g = hash12( gl_FragCoord.xy + fract( uTime ) * 431.7 ) - 0.5;
@@ -1320,66 +1581,47 @@ void main() {
 export const SKY_FRAG = /* glsl */ `
 varying vec3 vWorldDir;
 ${POST_COMMON}
+${ATMOSPHERE_GLSL}
 ${NOISE_GLSL}
+${SKY_UNIFORMS_GLSL}
+${SKY_CALL_GLSL}
 
-uniform vec3 uSunDir;
-uniform float uTurbidity;
-uniform float uRayleigh;
-uniform float uMieCoefficient;
-uniform float uMieG;
-uniform float uIntensity;
 uniform float uTime;
 uniform float uCloudCover;
-uniform vec3 uGroundColor;
-uniform float uExposureClamp;
+uniform float uSunDiscIntensity;
 
-const vec3 UP = vec3( 0.0, 1.0, 0.0 );
-const vec3 TOTAL_RAYLEIGH = vec3( 5.804542996261093e-6, 1.3562911419845635e-5, 3.0265902468824876e-5 );
-const vec3 MIE_CONST = vec3( 1.8399918514433978e14, 2.7798023919660528e14, 4.0790479543861094e14 );
-
-float rayleighPhase( float c ) { return ( 3.0 / ( 16.0 * PST_PI ) ) * ( 1.0 + c * c ); }
-
-float miePhase( float c, float g ) {
-  float g2 = g * g;
-  float inv = 1.0 / pow( max( 1e-4, 1.0 - 2.0 * g * c + g2 ), 1.5 );
-  return ( 1.0 / ( 4.0 * PST_PI ) ) * ( ( 1.0 - g2 ) * inv );
-}
-
-vec3 atmosphere( vec3 dir, out float sunDisc ) {
-  float sunE = 1000.0 * max( 0.0, 1.0 - exp( -( ( 1.5707963 - acos( clamp( uSunDir.y, -1.0, 1.0 ) ) ) / 1.5 ) ) );
-
-  vec3 betaR = TOTAL_RAYLEIGH * uRayleigh;
-  float c = ( 0.2 * uTurbidity ) * 10.0e-18;
-  vec3 betaM = 0.434 * c * MIE_CONST * uMieCoefficient;
-
-  float zenithAngle = acos( max( 0.0, dot( UP, dir ) ) );
-  float denom = cos( zenithAngle ) + 0.15 * pow( max( 1e-3, 93.885 - ( zenithAngle * 180.0 / PST_PI ) ), -1.253 );
-  float inverse = 1.0 / max( 1e-4, denom );
-  float sR = 8.4e3 * inverse;
-  float sM = 1.25e3 * inverse;
-
-  vec3 Fex = exp( -( betaR * sR + betaM * sM ) );
-
-  float cosTheta = dot( dir, uSunDir );
-  vec3 betaRTheta = betaR * rayleighPhase( cosTheta * 0.5 + 0.5 );
-  vec3 betaMTheta = betaM * miePhase( cosTheta, uMieG );
-
-  vec3 base = ( betaRTheta + betaMTheta ) / ( betaR + betaM );
-  vec3 Lin = pow( sunE * base * ( 1.0 - Fex ), vec3( 1.5 ) );
-  Lin *= mix(
-    vec3( 1.0 ),
-    pow( max( vec3( 0.0 ), sunE * base * Fex ), vec3( 0.5 ) ),
-    sat( pow( 1.0 - dot( UP, uSunDir ), 5.0 ) )
-  );
-
-  vec3 L0 = 0.1 * Fex;
-  float cosDisc = 0.999956; // ~0.53 degrees
-  sunDisc = smoothstep( cosDisc, cosDisc + 0.000045, cosTheta );
-  // Limb darkening so the disc has an edge instead of reading as a decal.
-  float limb = 1.0 - 0.32 * sat( ( cosDisc + 0.000045 - cosTheta ) / 0.000045 );
-  L0 += sunE * 3400.0 * Fex * sunDisc * limb;
-
-  return ( Lin + L0 ) * 0.04 + vec3( 0.0, 0.00035, 0.00085 );
+/**
+ * The solar disc, as a separate term added *after* the sky has been rolled.
+ *
+ * This is the whole of finding 5. The disc was already the right angular size —
+ * 0.53 degrees, with limb darkening — and already carried a radiance four
+ * orders of magnitude above the sky around it. Then min( sky, 4.0 ) flattened
+ * the disc and three hundred pixels of Mie aureole to the *same constant*, and
+ * what reached the frame was a cream plateau with no core, no edge and a radial
+ * profile that read 0.979 at the centre and 0.955 a hundred and fifty pixels
+ * out. A hole, not a sun. Rolling the sky and adding the disc on top leaves the
+ * core three orders of magnitude clear of its surroundings, so it survives the
+ * ACES shoulder as a small hard white core and the bloom chain gives it the
+ * steep skirt instead of glowing the whole sky uniformly.
+ *
+ * It is excluded from the IBL — the sun is already a directional light, and
+ * putting a 10,000-unit disc into the PMREM as well would double-count the key
+ * and blow every specular highlight in the level.
+ */
+vec3 sunDiscRadiance( vec3 dir, vec3 sunDir ) {
+  if ( uSunDiscIntensity <= 0.0 ) return vec3( 0.0 );
+  float cosTheta = dot( dir, sunDir );
+  const float cosDisc = 0.999956;   // ~0.53 degrees
+  const float softEdge = 0.0000075; // roughly one pixel at this field of view
+  float disc = smoothstep( cosDisc, cosDisc + softEdge, cosTheta );
+  if ( disc <= 0.0 ) return vec3( 0.0 );
+  // Limb darkening across the disc itself, not across its antialiased edge:
+  // the rim of the photosphere is genuinely ~35% down on the centre.
+  float r = sat( ( 1.0 - cosTheta ) / ( 1.0 - cosDisc ) );
+  float limb = 0.35 + 0.65 * sqrt( max( 0.0, 1.0 - r * r ) );
+  float zenithAngle = acos( clamp( sunDir.y, -1.0, 1.0 ) );
+  vec3 Fex = atmExtinction( zenithAngle, uTurbidity, uRayleigh, uMieCoefficient );
+  return atmSunE( sunDir ) * uSunDiscIntensity * Fex * disc * limb;
 }
 
 /**
@@ -1438,15 +1680,13 @@ vec4 cloudLayer( vec3 dir, float height, float scale, vec2 drift, float cover, f
 void main() {
   vec3 dir = normalize( vWorldDir );
 
-  float sunDisc;
-  vec3 sky = atmosphere( dir, sunDisc ) * uIntensity;
-
-  // Ground half of the dome: keeps the IBL from going black underneath and
-  // gives downward-facing normals a warm bounce term.
-  float below = smoothstep( 0.02, -0.10, dir.y );
-  vec3 horizonCol = atmosphere( normalize( vec3( dir.x, 0.02, dir.z ) ), sunDisc ) * uIntensity;
-  vec3 ground = uGroundColor * ( 0.35 + 0.65 * sat( uSunDir.y ) ) + horizonCol * 0.35;
-  sky = mix( sky, ground, below );
+  // Atmosphere, ground hemisphere, horizon band and roll — the exact call the
+  // composite's aerial perspective and the SSR fallback make.
+  vec3 horizonCol;
+  vec3 sky = skyDomeRadianceH(
+    dir, uSunDir, uTurbidity, uRayleigh, uMieCoefficient, uMieG,
+    uSkyIntensity, uGroundColor, uSkyRollKnee, uSkyRollMax, horizonCol
+  );
 
   if ( dir.y > 0.012 ) {
     float cosSun = dot( dir, uSunDir );
@@ -1459,16 +1699,16 @@ void main() {
     // by the ground below, so it goes blue-grey with a warm floor. The sunward
     // shoulder takes the sun's own colour, warm and well over unity so it can
     // clip into the bloom the way a real cloud edge does at this hour.
-    vec3 shadeLow = vec3( 0.20, 0.23, 0.31 ) * uIntensity + horizonCol * 0.25;
-    vec3 shadeHigh = vec3( 0.34, 0.37, 0.45 ) * uIntensity + horizonCol * 0.18;
-    vec3 litLow = mix( shadeLow, vec3( 1.55, 1.36, 1.10 ) * uIntensity, low.x );
-    vec3 litHigh = mix( shadeHigh, vec3( 1.32, 1.22, 1.08 ) * uIntensity, high.x );
+    vec3 shadeLow = vec3( 0.20, 0.23, 0.31 ) * uSkyIntensity + horizonCol * 0.25;
+    vec3 shadeHigh = vec3( 0.34, 0.37, 0.45 ) * uSkyIntensity + horizonCol * 0.18;
+    vec3 litLow = mix( shadeLow, vec3( 1.55, 1.36, 1.10 ) * uSkyIntensity, low.x );
+    vec3 litHigh = mix( shadeHigh, vec3( 1.32, 1.22, 1.08 ) * uSkyIntensity, high.x );
 
     // Silver lining. Forward scatter through a thin edge, so it only appears
     // where the sun is actually behind that edge, and it falls off sharply with
     // angle rather than glowing everywhere on the sunward half of the sky.
     float forward = pow( sat( cosSun ), 7.0 );
-    vec3 silver = vec3( 1.9, 1.62, 1.24 ) * uIntensity * forward;
+    vec3 silver = vec3( 1.9, 1.62, 1.24 ) * uSkyIntensity * forward;
     litLow += silver * low.z * 2.6;
     litHigh += silver * high.z * 1.8;
 
@@ -1480,27 +1720,22 @@ void main() {
 
     sky = mix( sky, litHigh * 0.85, sat( aHigh ) );
     sky = mix( sky, litLow * 0.9, sat( aLow ) );
+
+    // Cloud tops are the one part of the sky allowed above the roll, so a lit
+    // shoulder can still clip into the bloom the way a real one does. The disc
+    // is occluded by whatever cloud is in front of it.
+    sky = skyRoll( sky, uSkyRollKnee, uSkyRollMax * 1.35 );
+    sky += sunDiscRadiance( dir, uSunDir ) * ( 1.0 - sat( aLow ) ) * ( 1.0 - sat( aHigh ) * 0.75 );
+  } else {
+    sky += sunDiscRadiance( dir, uSunDir );
   }
 
-  // Horizon haze band. Real air never lets the horizon meet the ground clean,
-  // and this is also the band the aerial-perspective pass fades distant
-  // geometry into — if the two disagree the far buildings sit on a seam.
-  // Widened and strengthened so the transition happens over degrees, not over
-  // a hairline.
-  float hazeBand = exp( -abs( dir.y ) * 9.0 );
-  // Clamped: looking along a low sun the horizon sample sits inside the Mie
-  // aureole, and smearing that across the whole haze band is what turns the
-  // bottom third of a backlit sky into one flat white card.
-  vec3 haze = min( horizonCol, vec3( 1.6 ) ) * 1.04 + vec3( 0.012, 0.013, 0.015 ) * uIntensity;
-  sky = mix( sky, mix( sky, haze, 0.5 ) * vec3( 1.04, 1.01, 0.975 ), hazeBand * 0.5 );
-
-  sky = min( sky, vec3( uExposureClamp ) );
   gl_FragColor = vec4( max( vec3( 0.0 ), sky ), 1.0 );
 }
 `;
 
 /**
- * Cascade coverage helper appended to three's `common` chunk so every lit
+ * Cascade coverage helper appended to three's common chunk so every lit
  * material can weight its directional lights by cascade.
  */
 export const CSM_COVERAGE_GLSL = /* glsl */ `

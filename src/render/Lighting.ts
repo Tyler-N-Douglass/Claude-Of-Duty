@@ -25,10 +25,27 @@ const SPLIT_LAMBDA = 0.62;
  * shadows from their casters. Capped, and the depth bias carries the remainder.
  */
 const MAX_NORMAL_BIAS = 0.2;
-/** Sky fill as an absolute intensity — see the HemisphereLight construction. */
-const HEMI_INTENSITY = 0.26;
-/** Warm single-bounce fill, as a fraction of the sun. */
-const BOUNCE_FRACTION = 0.19;
+/**
+ * Sky fill as an absolute intensity — see the HemisphereLight construction.
+ *
+ * This and BOUNCE_FRACTION were sized against a sky dome running intensity 0.68
+ * with no radiance roll, where the dome itself carried most of the cool fill
+ * through the IBL. The dome is now 0.16 and rolls at 0.16, which was the right
+ * call for the sun and the exposure but took the blue out of every shadow in
+ * the level with it: the warm bounce was left as the only significant fill, so
+ * shadowed plaster measured warmer than neutral instead of cooler. The sky's
+ * share has to be paid explicitly now that the dome no longer pays it.
+ */
+const HEMI_INTENSITY = 1.30;
+/**
+ * Warm single-bounce fill, as a fraction of the sun.
+ *
+ * Still the term that keeps shadowed asphalt reading as warm grey rather than
+ * as blue ink — but at 0.19 against a 9.2 sun it was 1.75 units of near-orange
+ * light, several times the entire cool fill, and it was painting the shade the
+ * same hue as the sun. Cut so the bounce tints the shadows without owning them.
+ */
+const BOUNCE_FRACTION = 0.145;
 /**
  * The viewmodel rig's intensities were authored against the old exposure. The
  * pipeline now runs about two thirds of a stop darker so that the sun can be

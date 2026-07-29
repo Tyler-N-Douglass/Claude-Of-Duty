@@ -15,6 +15,8 @@ import {
   FINAL_FRAG,
   FULLSCREEN_VERT,
   GTAO_FRAG,
+  LUMA_DOWN_FRAG,
+  LUMA_INIT_FRAG,
   MOTION_BLUR_FRAG,
   OBJECT_VELOCITY_FRAG,
   OBJECT_VELOCITY_VERT,
@@ -30,6 +32,38 @@ const AO_STRENGTH = 0.8;
 const MIN_ADAPTIVE_SCALE = 0.6;
 const MAX_DYNAMIC_MESHES = 16;
 const DYNAMIC_REFRESH_FRAMES = 30;
+
+// --- Auto-exposure ---------------------------------------------------------
+/** Fixed metering pyramid: full frame -> 64x64 -> 8x8 -> 1x1. */
+const LUMA_L0 = 64;
+const LUMA_L1 = 8;
+/**
+ * Exposure the meter settles at on a reference street frame, and the frame's
+ * measured log-average luminance there.
+ *
+ * BASE is the number that decides how bright the game is: it puts sunlit
+ * plaster at the top of the tone curve's usable range and leaves a shadowed
+ * carriageway three stops under it.
+ */
+const EXPOSURE_BASE = 4.5;
+const METER_REFERENCE = 0.0724;
+/**
+ * How much of a metering error the camera actually acts on, in stops per stop.
+ *
+ * A raw `key / average` meter has unit gain, and unit gain is wrong for a game:
+ * two shots of the same town at the same hour, one up the street into the sun
+ * and one down it into shade, meter a stop and a half apart, and following that
+ * exactly means the player's world changes brightness every time they turn
+ * around. At 0.9 the camera still opens up meaningfully when they walk into a
+ * building — which is the whole point, it is what blows the windows — without
+ * re-grading the level on every mouse movement.
+ */
+const METER_GAIN = 0.9;
+const EXPOSURE_MIN = 1.6;
+const EXPOSURE_MAX = 8.5;
+/** Seconds to reach 1-1/e of a change. Opening up is quicker than stopping down. */
+const ADAPT_TAU_UP = 0.35;
+const ADAPT_TAU_DOWN = 1.2;
 
 function halton(index: number, base: number): number {
   let f = 1;
@@ -51,6 +85,28 @@ const JITTER: ReadonlyArray<readonly [number, number]> = Array.from({ length: 8 
 const _v3a = new THREE.Vector3();
 const _v3b = new THREE.Vector3();
 const _matA = new THREE.Matrix4();
+
+/**
+ * The uniform block declared by SKY_UNIFORMS_GLSL, verbatim.
+ *
+ * Every pass that needs to know what colour the air is — the aerial perspective
+ * in the composite, the SSR fallback — evaluates the same analytic sky the dome
+ * does, from these. Defaults match DEFAULT_SKY_PARAMS so a frame rendered
+ * before the sky system reports in is not wildly wrong.
+ */
+function skyUniformBlock(): Record<string, THREE.IUniform> {
+  return {
+    uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+    uTurbidity: { value: 6 },
+    uRayleigh: { value: 1.14 },
+    uMieCoefficient: { value: 0.0032 },
+    uMieG: { value: 0.7 },
+    uSkyIntensity: { value: 0.16 },
+    uGroundColor: { value: new THREE.Color(0.07, 0.058, 0.042) },
+    uSkyRollKnee: { value: 0.095 },
+    uSkyRollMax: { value: 0.16 },
+  };
+}
 
 interface DynamicEntry {
   mesh: THREE.Mesh;
@@ -87,6 +143,7 @@ export class RenderPipeline implements RenderSystem {
   private volumeRT: THREE.WebGLRenderTarget | null = null;
   private postA: THREE.WebGLRenderTarget | null = null;
   private postB: THREE.WebGLRenderTarget | null = null;
+  private luma: (THREE.WebGLRenderTarget | null)[] = [];
   private history: [THREE.WebGLRenderTarget | null, THREE.WebGLRenderTarget | null] = [null, null];
   private bloom: (THREE.WebGLRenderTarget | null)[] = [];
   private historyIndex = 0;
@@ -102,6 +159,8 @@ export class RenderPipeline implements RenderSystem {
   private mSsr!: THREE.ShaderMaterial;
   private mVolume: THREE.ShaderMaterial | null = null;
   private mComposite!: THREE.ShaderMaterial;
+  private mLumaInit!: THREE.ShaderMaterial;
+  private mLumaDown!: THREE.ShaderMaterial;
   private mBloomPrefilter!: THREE.ShaderMaterial;
   private mBloomDown!: THREE.ShaderMaterial;
   private mBloomUp!: THREE.ShaderMaterial;
@@ -123,14 +182,28 @@ export class RenderPipeline implements RenderSystem {
 
   // Post state ---------------------------------------------------------------
   /**
-   * The lighting rig's sun went up and its ambient came down by more, which is
-   * a contrast change rather than a brightness change — so the exposure has to
-   * absorb the difference or the whole frame simply gets hotter. Set by the
-   * highlight end, because that is the end with no headroom: sunlit plaster
-   * lands around 0.75, which leaves the sky's diffuse dome under the shoulder
-   * and lets the shadows fall where the ratio puts them, near 0.08.
+   * Metered exposure, and the reason there used to be no such thing.
+   *
+   * This was a hard-coded constant, which meant the camera was exposed for the
+   * street everywhere — including inside a building, where a window onto full
+   * sunlight measured *darker* than the wall it was punched through and you
+   * could read louvre slats and a potted plant through it. No camera does that.
+   * Standing in an interior three stops down from the street, a lens exposed
+   * for the interior blows the exterior to a clipped white rectangle, and that
+   * rectangle is most of what tells the player where the light is coming from.
+   *
+   * `exposure` is the adapted value the shaders see; `exposureTarget` is what
+   * the meter last asked for; `exposureBias` is the player's brightness slider,
+   * which multiplies rather than replaces — otherwise the settings menu writing
+   * its default of 1.0 on the first frame silently overrode the whole rig.
    */
-  private exposure = 1.3;
+  private exposure = EXPOSURE_BASE;
+  private exposureTarget = EXPOSURE_BASE;
+  private exposureBias = 1;
+  private meteredLuminance = METER_REFERENCE;
+  private lumaValid = false;
+  private lumaPrimed = false;
+  private readonly lumaPixel = new Uint8Array(4);
   private focusDistance = 8;
   private focusTarget = 8;
   private focusVelocity = 0;
@@ -143,12 +216,16 @@ export class RenderPipeline implements RenderSystem {
   private dynamics: DynamicEntry[] = [];
   private dynamicRefresh = 0;
   /**
-   * FXAA is the only anti-aliasing when TAA is off, but it is a full-resolution
-   * 13-tap pass and a machine already missing frame time cannot pay for it.
-   * Latched off frame-time with hysteresis, and off to begin with so the very
-   * first frame — always the most expensive one — never carries it.
+   * FXAA is the only anti-aliasing when TAA is off, so it is not optional.
+   *
+   * It used to be latched off frame time: any frame slower than 45ms turned it
+   * off. Every frame on a software rasteriser is slower than 45ms, and the
+   * software rasteriser is what the review captures run on — so every shipped
+   * screenshot had raw stair-stepped silhouettes against the sky, a scan across
+   * the bell tower stepping 0.32 to 0.61 in one pixel. A 13-tap pass that only
+   * fires on edges is not what is costing this frame 58ms; it runs.
    */
-  private fxaaOn = false;
+  private fxaaOn = true;
 
   // -------------------------------------------------------------------------
   // Lifecycle
@@ -203,8 +280,27 @@ export class RenderPipeline implements RenderSystem {
     this.manualFocusTimer = 1.5;
   }
 
+  /**
+   * The brightness slider, as an EV bias on the metered exposure rather than an
+   * absolute override. The menu writes its default on the first frame; if that
+   * replaced the exposure outright the auto-exposure would never once be seen.
+   */
   setExposure(v: number): void {
-    this.exposure = THREE.MathUtils.clamp(v, 0.05, 8);
+    this.exposureBias = THREE.MathUtils.clamp(v, 0.4, 2.2);
+  }
+
+  /** Diagnostics for the visual-QA harness: what the meter is actually doing. */
+  get exposureDebug(): {
+    exposure: number; target: number; luminance: number; bias: number; code: number; valid: boolean;
+  } {
+    return {
+      exposure: this.exposure,
+      target: this.exposureTarget,
+      luminance: this.meteredLuminance,
+      bias: this.exposureBias,
+      code: this.lumaPixel[0],
+      valid: this.lumaValid,
+    };
   }
 
   /** Current internal render scale, 0.6..1. Useful for HUD diagnostics. */
@@ -328,11 +424,7 @@ export class RenderPipeline implements RenderSystem {
         uThickness: { value: 0.65 },
         uMaxDistance: { value: 26 },
         uReflectivity: { value: 0.55 },
-        uSkyZenith: { value: new THREE.Color(0.15, 0.4, 1.0) },
-        uSkyHorizon: { value: new THREE.Color(1.2, 1.1, 1.0) },
-        uSkyGround: { value: new THREE.Color(0.1, 0.09, 0.08) },
-        uSunColor: { value: new THREE.Color(1, 0.85, 0.65) },
-        uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+        ...skyUniformBlock(),
       },
       { SSR_STEPS: q.preset === 'ultra' ? 28 : 18 },
     );
@@ -364,24 +456,39 @@ export class RenderPipeline implements RenderSystem {
       // of that. Distance therefore reads as *air*, with the near-sun side of
       // the frame hazing warm and the away side hazing cool, and the ground
       // plane hazing harder than anything standing on it.
-      uFogDensity: { value: 0.0072 },
+      uFogDensity: { value: 0.0050 },
       uFogHeightFalloff: { value: 0.1 },
       uFogBaseHeight: { value: -1.0 },
-      uFogStart: { value: 13 },
+      uFogStart: { value: 17 },
       uFogDesaturate: { value: 0.4 },
-      uSkyZenith: { value: new THREE.Color(0.15, 0.4, 1.0) },
-      uSkyHorizon: { value: new THREE.Color(1.2, 1.1, 1.0) },
-      uSkyGround: { value: new THREE.Color(0.1, 0.09, 0.08) },
-      uSunColor: { value: new THREE.Color(1, 0.85, 0.65) },
-      uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+      ...skyUniformBlock(),
+    });
+
+    this.mLumaInit = this.makeMaterial(LUMA_INIT_FRAG, {
+      tDiffuse: { value: null },
+      tDepth: { value: null },
+      uSrcTexel: { value: new THREE.Vector2() },
+      uBlock: { value: new THREE.Vector2() },
+      uSkyWeight: { value: 0.12 },
+    });
+
+    this.mLumaDown = this.makeMaterial(LUMA_DOWN_FRAG, {
+      tDiffuse: { value: null },
+      uSrcTexel: { value: new THREE.Vector2() },
+      uBlock: { value: new THREE.Vector2() },
     });
 
     this.mBloomPrefilter = this.makeMaterial(BLOOM_PREFILTER_FRAG, {
       tDiffuse: { value: null },
       uTexel: { value: new THREE.Vector2() },
-      uThreshold: { value: 1.35 },
-      uKnee: { value: 0.6 },
-      uClamp: { value: 3.0 },
+      // In exposed space. The diffuse sky now sits well under this and only the
+      // solar disc and the hottest cloud shoulders cross it — which is the
+      // difference between a sun with a bloom skirt and a uniformly glowing sky
+      // with a hole in it. The clamp is high because the disc is meant to
+      // dominate the chain; it is four pixels across.
+      uThreshold: { value: 5.0 },
+      uKnee: { value: 0.7 },
+      uClamp: { value: 12.0 },
       uExposure: { value: 1.6 },
     });
 
@@ -446,24 +553,37 @@ export class RenderPipeline implements RenderSystem {
       tBloom: { value: null },
       uExposure: { value: 1 },
       uBloomStrength: { value: q.bloom ? 0.055 : 0 },
-      uLift: { value: new THREE.Vector3(0.017, 0.020, 0.029) },
-      uGamma: { value: new THREE.Vector3(1.0, 1.0, 1.03) },
-      uGain: { value: new THREE.Vector3(1.025, 1.0, 0.972) },
-      // Pushed well past the previous split. Shadowed faces go cool, sunlit
-      // faces go warm, and the eye reads the difference as light rather than as
-      // pigment — which is the whole trick, because the pigment is then free to
-      // come down.
-      uShadowTint: { value: new THREE.Vector3(0.9, 0.965, 1.085) },
-      uHighlightTint: { value: new THREE.Vector3(1.12, 1.005, 0.85) },
+      // Zero, and it stays zero. See the note in TONEMAP_FRAG: this uniform is
+      // applied while the buffer is still display-linear, so any non-zero value
+      // here becomes a floor two and a half stops higher than it reads. The
+      // film black is uFilmBlack in the final pass.
+      uLift: { value: new THREE.Vector3(0, 0, 0) },
+      uGamma: { value: new THREE.Vector3(1.0, 1.0, 1.015) },
+      // Near-neutral. With the split tone now firing on the correct end of the
+      // range, a global warm gain on top of it only pushes shadows back toward
+      // the warm side the split tone just took them off.
+      uGain: { value: new THREE.Vector3(1.012, 1.0, 0.986) },
+      // Shadowed faces go cool, sunlit faces go warm, and the eye reads the
+      // difference as light rather than as pigment — which is the whole trick,
+      // because the pigment is then free to come down.
+      uShadowTint: { value: new THREE.Vector3(0.785, 0.945, 1.25) },
+      uHighlightTint: { value: new THREE.Vector3(1.13, 1.005, 0.845) },
       // Call of Duty's palette is far more desaturated than anyone remembers.
       // It earns its colour from the light, not from the materials.
-      uSaturation: { value: 0.86 },
-      uContrast: { value: 1.09 },
-      // Filmic toe and shoulder. ACES has its own, but the pivot contrast above
-      // it used to be a straight line into a hard clamp, which is what put the
-      // frame in a narrow mid band with no black and no roll-off at the top.
-      uToe: { value: 0.14 },
-      uShoulder: { value: 0.75 },
+      uSaturation: { value: 0.88 },
+      // Contrast, toe and shoulder are one design, solved together against the
+      // scene's measured sun-to-shadow ratio: a surface three stops under the
+      // key has to land near sRGB 0.10 while the key itself lands near 0.75,
+      // and nothing above the shoulder may clip flat. 1.09 with a toe knee at
+      // 0.2 could not do that from any exposure — it compressed a five-stop
+      // scene into a 1.6-stop grey band.
+      uContrast: { value: 1.34 },
+      uToe: { value: 0.64 },
+      uToeKnee: { value: 0.078 },
+      uShoulder: { value: 0.655 },
+      // Pre-shoulder value that maps to display white. Only the solar disc and
+      // a surface looking straight at it get anywhere near it.
+      uWhitePoint: { value: 1.27 },
     });
 
     this.mFinal = this.makeMaterial(FINAL_FRAG, {
@@ -476,6 +596,9 @@ export class RenderPipeline implements RenderSystem {
       uGrain: { value: 0.026 },
       uSharpen: { value: 0.24 },
       uFxaa: { value: 0 },
+      // sRGB code 3 of 255, cool-tinted. A print black, not a lifted shadow.
+      uFilmBlack: { value: 0.012 },
+      uFilmBlackTint: { value: new THREE.Vector3(0.86, 0.92, 1.06) },
     });
 
   }
@@ -549,7 +672,8 @@ export class RenderPipeline implements RenderSystem {
   private disposeTargets(): void {
     const all = [
       this.sceneRT, this.velocityRT, this.aoRT, this.aoTmpRT, this.ssrRT, this.ssrTmpRT,
-      this.volumeRT, this.postA, this.postB, this.history[0], this.history[1], ...this.bloom,
+      this.volumeRT, this.postA, this.postB, this.history[0], this.history[1],
+      ...this.bloom, ...this.luma,
     ];
     for (const rt of all) {
       if (!rt) continue;
@@ -560,6 +684,8 @@ export class RenderPipeline implements RenderSystem {
     this.ssrRT = this.ssrTmpRT = this.volumeRT = this.postA = this.postB = null;
     this.history = [null, null];
     this.bloom = [];
+    this.luma = [];
+    this.lumaValid = false;
   }
 
   private allocate(): void {
@@ -594,6 +720,17 @@ export class RenderPipeline implements RenderSystem {
     this.ssrRT = this.makeTarget(hw, hh, half, false);
     this.ssrTmpRT = this.makeTarget(hw, hh, half, false);
     this.volumeRT = this.makeTarget(hw, hh, half, false);
+
+    // Metering pyramid. Byte targets: the value stored is a log2 encoding, so
+    // eight bits over a 28-stop window quantise to 0.11 stops — under the
+    // threshold of a visible exposure step — and a single byte texel can be
+    // read back per frame without dragging a float format through readPixels.
+    this.luma = [
+      this.makeTarget(LUMA_L0, LUMA_L0, THREE.UnsignedByteType, false),
+      this.makeTarget(LUMA_L1, LUMA_L1, THREE.UnsignedByteType, false),
+      this.makeTarget(1, 1, THREE.UnsignedByteType, false),
+    ];
+    this.lumaValid = false;
 
     this.bloom = [];
     for (let i = 0; i < BLOOM_LEVELS; i++) {
@@ -649,6 +786,89 @@ export class RenderPipeline implements RenderSystem {
       this.lowFpsTimer = 0;
       this.highFpsTimer = 0;
     }
+  }
+
+  /**
+   * Folds the scene's log-average luminance down to one texel.
+   *
+   * Metering is done on the world target *before* the viewmodel is composited
+   * over it: the gun is dark, close and covers a fifth of the frame, and a
+   * meter that includes it opens up a stop every time the player looks at a
+   * wall. Three draws, sixty-five thousand taps, all of it on targets no larger
+   * than 64x64.
+   */
+  private renderLuminance(scene: THREE.WebGLRenderTarget, w: number, h: number): void {
+    const l0 = this.luma[0];
+    const l1 = this.luma[1];
+    const l2 = this.luma[2];
+    if (!l0 || !l1 || !l2) return;
+
+    const a = this.mLumaInit.uniforms;
+    a.tDiffuse.value = scene.texture;
+    a.tDepth.value = scene.depthTexture;
+    (a.uSrcTexel.value as THREE.Vector2).set(1 / w, 1 / h);
+    (a.uBlock.value as THREE.Vector2).set(w / LUMA_L0, h / LUMA_L0);
+    this.blit(this.mLumaInit, l0);
+
+    const b = this.mLumaDown.uniforms;
+    b.tDiffuse.value = l0.texture;
+    (b.uSrcTexel.value as THREE.Vector2).set(1 / LUMA_L0, 1 / LUMA_L0);
+    (b.uBlock.value as THREE.Vector2).set(LUMA_L0 / LUMA_L1, LUMA_L0 / LUMA_L1);
+    this.blit(this.mLumaDown, l1);
+
+    b.tDiffuse.value = l1.texture;
+    (b.uSrcTexel.value as THREE.Vector2).set(1 / LUMA_L1, 1 / LUMA_L1);
+    (b.uBlock.value as THREE.Vector2).set(LUMA_L1, LUMA_L1);
+    this.blit(this.mLumaDown, l2);
+
+    this.lumaValid = true;
+  }
+
+  /**
+   * Reads *last* frame's metering texel and adapts toward it.
+   *
+   * Deliberately one frame late: reading a texel the GPU finished with a whole
+   * frame ago costs nothing, where reading one written moments earlier stalls
+   * the pipeline on a fence. Nobody can see a frame of exposure latency; a
+   * hitch every frame is the only thing they would see.
+   *
+   * The two time constants are asymmetric because adaptation is: a camera
+   * stopping down when the player steps into sun should lag, a camera opening
+   * up when they step into a doorway should not. Both accelerate when the error
+   * is large, so walking through a door is a rack, not a slow fade.
+   */
+  private sampleExposure(dt: number): void {
+    const target = this.luma[2];
+    if (target && this.lumaValid) {
+      try {
+        this.renderer.readRenderTargetPixels(target, 0, 0, 1, 1, this.lumaPixel);
+        const encoded = this.lumaPixel[0] / 255;
+        const logLum = encoded * 28 - 14;
+        this.meteredLuminance = Math.pow(2, logLum);
+      } catch {
+        /* readback unsupported: hold the last reading */
+      }
+    }
+
+    this.exposureTarget = THREE.MathUtils.clamp(
+      EXPOSURE_BASE * Math.pow(METER_REFERENCE / Math.max(this.meteredLuminance, 1e-4), METER_GAIN),
+      EXPOSURE_MIN,
+      EXPOSURE_MAX,
+    );
+
+    if (!this.lumaPrimed) {
+      if (this.lumaValid) {
+        this.exposure = this.exposureTarget;
+        this.lumaPrimed = true;
+      }
+      return;
+    }
+
+    const stops = Math.abs(Math.log2(Math.max(this.exposureTarget, 1e-4) / Math.max(this.exposure, 1e-4)));
+    const base = this.exposureTarget > this.exposure ? ADAPT_TAU_UP : ADAPT_TAU_DOWN;
+    const tau = base / (1 + 1.6 * Math.max(0, stops - 1));
+    const alpha = 1 - Math.exp(-Math.max(dt, 0) / Math.max(tau, 1e-3));
+    this.exposure += (this.exposureTarget - this.exposure) * alpha;
   }
 
   private updateFocus(ctx: GameContext): void {
@@ -711,6 +931,8 @@ export class RenderPipeline implements RenderSystem {
 
     this.updateAdaptiveScale(ctx);
     if (this.targetsDirty) this.allocate();
+    // Before anything overwrites the metering texel this frame.
+    this.sampleExposure(Math.min(ctx.time.dt, 0.1));
 
     const lighting = ctx.system<LightingSystem>('lighting');
     const sky = ctx.system<SkySystem>('sky');
@@ -751,6 +973,9 @@ export class RenderPipeline implements RenderSystem {
     r.setRenderTarget(scene);
     r.autoClear = true;
     r.render(ctx.scene, camera);
+
+    // --- 1b. Meter the world, before the viewmodel goes over it ------------
+    this.renderLuminance(scene, w, h);
 
     // --- 2. Velocity -------------------------------------------------------
     const needVelocity = q.motionBlur || taaOn;
@@ -865,7 +1090,7 @@ export class RenderPipeline implements RenderSystem {
       const u = this.mTonemap.uniforms;
       u.tDiffuse.value = resolved;
       u.tBloom.value = bloomTexture;
-      u.uExposure.value = this.exposure;
+      u.uExposure.value = this.exposure * this.exposureBias;
       u.uBloomStrength.value = bloomTexture ? 0.055 : 0;
       this.blit(this.mTonemap, tonemapTarget);
     }
@@ -878,10 +1103,7 @@ export class RenderPipeline implements RenderSystem {
       u.uTime.value = ctx.time.elapsed;
       // MSAA is unavailable through render targets and the renderer is created
       // with antialias:false, so with TAA off FXAA is the only thing standing
-      // between the player and crawling geometry edges — when it is affordable.
-      const frameMs = ctx.time.rawDt;
-      if (frameMs > 0.045) this.fxaaOn = false;
-      else if (frameMs > 0 && frameMs < 0.020) this.fxaaOn = true;
+      // between the player and crawling geometry edges. It is not conditional.
       u.uFxaa.value = !taaOn && this.fxaaOn ? 1 : 0;
       // Unsharp mask amplifies whatever the upscale reconstructed. Backing it
       // off with the internal resolution keeps a 0.7-scale frame from turning
@@ -1036,13 +1258,7 @@ export class RenderPipeline implements RenderSystem {
     (u.uInvFullRes.value as THREE.Vector2).set(1 / w, 1 / h);
     (u.uNearFar.value as THREE.Vector2).set(camera.near, camera.far);
     u.uFrame.value = ctx.time.frame % 64;
-    if (sky) {
-      (u.uSkyZenith.value as THREE.Color).copy(sky.zenithColor);
-      (u.uSkyHorizon.value as THREE.Color).copy(sky.horizonColor);
-      (u.uSkyGround.value as THREE.Color).copy(sky.groundColor);
-      (u.uSunColor.value as THREE.Color).copy(sky.sunColor);
-      (u.uSunDir.value as THREE.Vector3).copy(sky.sunDirection);
-    }
+    this.applySkyUniforms(u, sky);
     this.blit(this.mSsr, ssr);
 
     const b = this.mBlur.uniforms;
@@ -1109,7 +1325,7 @@ export class RenderPipeline implements RenderSystem {
 
     const pre = this.mBloomPrefilter.uniforms;
     pre.tDiffuse.value = source;
-    pre.uExposure.value = this.exposure;
+    pre.uExposure.value = this.exposure * this.exposureBias;
     (pre.uTexel.value as THREE.Vector2).set(1 / w, 1 / h);
     this.blit(this.mBloomPrefilter, first);
 
@@ -1151,13 +1367,21 @@ export class RenderPipeline implements RenderSystem {
     u.uAoStrength.value = aoOn ? AO_STRENGTH : 0;
     u.uSsrEnabled.value = ssrOn ? 1 : 0;
     u.uVolumeEnabled.value = volumeOn ? 1 : 0;
-    if (sky) {
-      (u.uSkyZenith.value as THREE.Color).copy(sky.zenithColor);
-      (u.uSkyHorizon.value as THREE.Color).copy(sky.horizonColor);
-      (u.uSkyGround.value as THREE.Color).copy(sky.groundColor);
-      (u.uSunColor.value as THREE.Color).copy(sky.sunColor);
-      (u.uSunDir.value as THREE.Vector3).copy(sky.sunDirection);
-    }
+    this.applySkyUniforms(u, sky);
+  }
+
+  /** Copies the live sky parameters into any pass that evaluates the dome. */
+  private applySkyUniforms(u: Record<string, THREE.IUniform>, sky: SkySystem | undefined): void {
+    if (!sky) return;
+    (u.uSunDir.value as THREE.Vector3).copy(sky.sunDirection);
+    u.uTurbidity.value = sky.params.turbidity;
+    u.uRayleigh.value = sky.params.rayleigh;
+    u.uMieCoefficient.value = sky.params.mieCoefficient;
+    u.uMieG.value = sky.params.mieG;
+    u.uSkyIntensity.value = sky.params.intensity;
+    (u.uGroundColor.value as THREE.Color).copy(sky.groundLinear);
+    u.uSkyRollKnee.value = sky.rollKnee;
+    u.uSkyRollMax.value = sky.rollMax;
   }
 
   private renderFallback(ctx: GameContext): void {
@@ -1177,7 +1401,8 @@ export class RenderPipeline implements RenderSystem {
     this.disposeTargets();
     const materials = [
       this.mCameraVelocity, this.mObjectVelocity, this.mViewmodelVelocity, this.mGtao, this.mBlur,
-      this.mSsr, this.mVolume, this.mComposite, this.mBloomPrefilter, this.mBloomDown, this.mBloomUp,
+      this.mSsr, this.mVolume, this.mComposite, this.mLumaInit, this.mLumaDown,
+      this.mBloomPrefilter, this.mBloomDown, this.mBloomUp,
       this.mMotionBlur, this.mDof, this.mTaa, this.mTonemap, this.mFinal,
     ];
     for (const m of materials) m?.dispose();

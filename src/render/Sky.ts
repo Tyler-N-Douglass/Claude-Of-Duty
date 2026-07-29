@@ -57,11 +57,42 @@ export interface SkyParams {
 export const DEFAULT_SKY_PARAMS: SkyParams = {
   turbidity: 6.0,
   rayleigh: 1.14,
-  mieCoefficient: 0.0044,
-  mieG: 0.76,
-  intensity: 0.68,
+  // Mie was carrying the frame's whole failure of contrast. At 0.0044 with a
+  // g of 0.76 the forward lobe put several hundred pixels of sky at the top of
+  // the range around the sun, and — because this same dome is the IBL — every
+  // shadowed surface in the level was being filled by it. Backing both off
+  // narrows the aureole to something a solar disc can punch through and takes
+  // the sky's share of the fill budget down with it.
+  mieCoefficient: 0.0032,
+  mieG: 0.7,
+  // The sky was rendering brighter than sunlit plaster, which is backwards: a
+  // white wall in direct sun is two to four times the luminance of clear blue
+  // sky, not a third of it. That inversion is most of why shadows and highlights
+  // measured a tenth of a stop apart — the dome was flooding the whole street.
+  intensity: 0.16,
   cloudCover: 0.5,
 };
+
+/**
+ * Where the dome's radiance starts to roll, and what it asymptotes to.
+ *
+ * Not a clamp. `min( sky, 4.0 )` is what turned the sun into a flat cream
+ * plateau three hundred pixels across — the disc and the aureole around it were
+ * being written the same constant. A hyperbolic roll leaves everything under
+ * the knee exact, keeps a gradient all the way up, and lets the solar disc,
+ * added after the roll, sit three orders of magnitude clear of its surroundings.
+ */
+export const SKY_ROLL_KNEE = 0.095;
+export const SKY_ROLL_MAX = 0.16;
+/**
+ * Solar disc radiance, as a multiplier on the Preetham `sunE` term.
+ *
+ * Absurdly large on purpose: the sun is about 0.53 degrees across, which is
+ * four pixels at this field of view, and it has to survive an ACES shoulder as
+ * a hard white core with a bloom skirt rather than as a slightly brighter patch
+ * of sky. It is excluded from the IBL — the sun is already a directional light.
+ */
+export const SUN_DISC_INTENSITY = 46.0;
 
 // Preetham fits for sea-level air; identical values drive the GPU dome so the
 // CPU-side colours used for fog, IBL tinting and reflections cannot drift.
@@ -162,6 +193,11 @@ export class SkySystem implements System {
   readonly horizonColor = new THREE.Color();
   readonly groundColor = new THREE.Color();
   readonly sunColor = new THREE.Color();
+  /** Lower hemisphere albedo, in linear space. Shared with every pass. */
+  readonly groundLinear = new THREE.Color().setHex(0x4a4239, THREE.SRGBColorSpace);
+  /** Roll parameters, published so the composite's haze rolls identically. */
+  readonly rollKnee = SKY_ROLL_KNEE;
+  readonly rollMax = SKY_ROLL_MAX;
   /**
    * IBL weight, and the single most important number in the frame.
    *
@@ -169,12 +205,16 @@ export class SkySystem implements System {
    * to the PBR ambient at anything near unity it becomes the dominant light on
    * every surface the sun cannot reach, which is most of a street canyon at 21
    * degrees. That is what makes engine screenshots look like they were shot
-   * through a blue gel. Real golden-hour sun-to-skylight is 6:1 to 10:1 in
-   * linear terms; with the sun at 7.4 and a warm bounce carrying part of the
-   * fill, the sky's share of that budget is a little over half a unit — a third
-   * of what it was, and the far side of the point where shadows crush.
+   * through a blue gel.
+   *
+   * At 0.78, against a dome that was itself two stops hot, it was not a fill —
+   * it was the key. A sunlit facade measured 0.12 of scene radiance and the
+   * shadowed carriageway in front of it measured 0.064: a ratio of under two to
+   * one, when the rig was authored for seven. No tone curve can put a sunlit
+   * wall at sRGB 0.75 and a shadow at 0.10 out of that; the range has to exist
+   * in the scene first. Halved, and the dome behind it dimmed as well.
    */
-  environmentIntensity = 0.78;
+  environmentIntensity = 0.82;
 
   private ctx: GameContext | null = null;
   private timeOfDay = DEFAULT_TIME_OF_DAY;
@@ -194,8 +234,6 @@ export class SkySystem implements System {
     sunDirectionForTime(this.timeOfDay, this.sunDirection);
     this.recomputeColors();
 
-    const groundLinear = new THREE.Color().setHex(0x4a4239, THREE.SRGBColorSpace);
-
     this.material = new THREE.ShaderMaterial({
       name: 'SkyDome',
       uniforms: {
@@ -204,11 +242,13 @@ export class SkySystem implements System {
         uRayleigh: { value: this.params.rayleigh },
         uMieCoefficient: { value: this.params.mieCoefficient },
         uMieG: { value: this.params.mieG },
-        uIntensity: { value: this.params.intensity },
+        uSkyIntensity: { value: this.params.intensity },
         uTime: { value: 0 },
         uCloudCover: { value: this.params.cloudCover },
-        uGroundColor: { value: groundLinear },
-        uExposureClamp: { value: 4.0 },
+        uGroundColor: { value: this.groundLinear },
+        uSkyRollKnee: { value: SKY_ROLL_KNEE },
+        uSkyRollMax: { value: SKY_ROLL_MAX },
+        uSunDiscIntensity: { value: SUN_DISC_INTENSITY },
       },
       vertexShader: SKY_VERT,
       fragmentShader: SKY_FRAG,
@@ -288,7 +328,7 @@ export class SkySystem implements System {
     m.uniforms.uRayleigh.value = this.params.rayleigh;
     m.uniforms.uMieCoefficient.value = this.params.mieCoefficient;
     m.uniforms.uMieG.value = this.params.mieG;
-    m.uniforms.uIntensity.value = this.params.intensity;
+    m.uniforms.uSkyIntensity.value = this.params.intensity;
     m.uniforms.uCloudCover.value = this.params.cloudCover;
     if (this.fog) this.fog.color.copy(this.horizonColor);
   }
@@ -317,12 +357,19 @@ export class SkySystem implements System {
     if (!ctx || !this.pmrem || !this.envScene) return;
 
     const previous = this.envTarget;
+    // The disc is a directional light already. Baking a ~7000-unit fireball
+    // into the PMREM as well double-counts the key and puts a second, blurrier
+    // sun into every specular highlight in the level.
+    const discUniform = this.material?.uniforms.uSunDiscIntensity;
+    if (discUniform) discUniform.value = 0;
     try {
       this.envTarget = this.pmrem.fromScene(this.envScene, 0, 0.5, 5000);
     } catch (err) {
       console.error('[sky] PMREM generation failed', err);
       this.envTarget = previous;
       return;
+    } finally {
+      if (discUniform) discUniform.value = SUN_DISC_INTENSITY;
     }
     if (previous && previous !== this.envTarget) previous.dispose();
 
