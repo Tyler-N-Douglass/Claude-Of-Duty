@@ -98,6 +98,15 @@ export const SUN_DISC_INTENSITY = 46.0;
 // CPU-side colours used for fog, IBL tinting and reflections cannot drift.
 const TOTAL_RAYLEIGH = [5.804542996261093e-6, 1.3562911419845635e-5, 3.0265902468824876e-5] as const;
 const MIE_CONST = [1.8399918514433978e14, 2.7798023919660528e14, 4.0790479543861094e14] as const;
+/**
+ * Dust chroma pull. Must stay identical to ATM_DUST / ATM_DUST_TINT in
+ * ATMOSPHERE_GLSL — see the note there for why clean-air Preetham is the wrong
+ * hue for this map. These are the numbers the fog colour, the hemisphere fill
+ * and the reflection fallback are derived from, and if they drift from the
+ * dome's the far end of the street stops matching the pixel above it.
+ */
+const ATM_DUST = 0.60;
+const ATM_DUST_TINT = [1.075, 1.0, 0.925] as const;
 
 const _dir = new THREE.Vector3();
 const _tmpColor = new THREE.Color();
@@ -154,7 +163,13 @@ export function evaluateSkyRadiance(
     const base = (betaR * rPhase + betaM * mPhase) / (betaR + betaM);
     let lin = Math.pow(Math.max(0, sunE * base * (1 - fex)), 1.5);
     lin *= 1 + (Math.pow(Math.max(0, sunE * base * fex), 0.5) - 1) * mixFactor;
-    rgb[i] = ((lin + 0.1 * fex) * 0.04 + bias[i]) * p.intensity;
+    rgb[i] = (lin + 0.1 * fex) * 0.04 + bias[i];
+  }
+  // Same dust pull the dome applies, before the intensity scale — which is
+  // where the shader applies it too, since uSkyIntensity multiplies the call.
+  const lum = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+  for (let i = 0; i < 3; i++) {
+    rgb[i] = (rgb[i] * (1 - ATM_DUST) + lum * ATM_DUST_TINT[i] * ATM_DUST) * p.intensity;
   }
   return out.setRGB(Math.max(0, rgb[0]), Math.max(0, rgb[1]), Math.max(0, rgb[2]), THREE.LinearSRGBColorSpace);
 }
@@ -178,8 +193,15 @@ export function sunLightColor(sunDir: THREE.Vector3, p: SkyParams, out = new THR
   out.setRGB(rgb[0] / peak, rgb[1] / peak, rgb[2] / peak, THREE.LinearSRGBColorSpace);
   // Physical extinction alone drifts too orange to grade; pull it back toward
   // the art-directed golden-hour key.
+  //
+  // At 0.45 this key ran a red-over-blue of 1.79, and since it is the key it set
+  // the hue of every sunlit surface in the level: the sand measured 1.35 to 1.44
+  // across the whole carriageway, which is a pigment, not a light. Golden hour is
+  // warm light falling on materials that still have their own colour. Backed off
+  // to 0.33 the key sits at 1.68 and the separation the frame reads as sunlight —
+  // this against a sky fill the dust pull now puts near 0.4 — is untouched.
   _tmpColor.setHex(0xffd9a8, THREE.SRGBColorSpace);
-  return out.lerp(_tmpColor, 0.45);
+  return out.lerp(_tmpColor, 0.33);
 }
 
 export class SkySystem implements System {

@@ -289,10 +289,14 @@ function buildReticleTexture(kind: ReticleKind, size = 256): THREE.DataTexture {
   switch (kind) {
     case 'dot':
       // Tight core, wide skirt — the shape a real emitter's bloom actually has,
-      // and the thing a uniform glow always gets wrong.
-      dot(c, c, size * 0.034, size * 0.105, 0.09);
-      dot(c, c, size * 0.017, size * 0.030, 0.32);
-      dot(c, c, size * 0.011, size * 0.013, 1);
+      // and the thing a uniform glow always gets wrong. The skirt was carrying
+      // nearly a tenth of full brightness out to a seventh of the plane, which
+      // through additive blending and the bloom pass came back as a soft blob
+      // the size of a thumbnail. Halved in gain and pulled in, so what survives
+      // the bloom is a hard point with a halo rather than a glowing lozenge.
+      dot(c, c, size * 0.026, size * 0.072, 0.045);
+      dot(c, c, size * 0.014, size * 0.024, 0.26);
+      dot(c, c, size * 0.008, size * 0.010, 1);
       break;
     case 'holo':
       dot(c, c, size * 0.34, size * 0.10, 0.06);
@@ -606,28 +610,61 @@ function makeTriplanarMaterial(
 /**
  * Anti-reflective coated optic glass.
  *
- * The four things that make a lens read as glass rather than as a hole:
- * a near-black tinted core, a blue-green AR sheen that only appears off-axis,
- * one soft circular reflection of the sky sitting across the surface (a lens is
- * a mirror the moment it is not pointed at you), and a bright meniscus where
- * the glass curves into its housing. All four are cheap; the last two are the
- * ones normally missing, and their absence is exactly what makes procedural
- * optics look like painted discs.
+ * The previous version was a flat disc filled with a saturated turquoise and
+ * ringed with a hard bright annulus, and it read exactly as what it was: a
+ * backlit plastic button. Three things were wrong and all three are geometric
+ * rather than a matter of picking a nicer colour.
+ *
+ * First, the coating was a *fill*. A real AR stack passes about 99% on axis;
+ * what the eye picks up is the residual reflection, and that residual is a
+ * function of angle, so it must be near-absent looking down the tube and only
+ * gather as the surface turns away. Second, the element is a spherical cap, and
+ * a flat circle has no angle to gather against — hence `uCurve`, which bends
+ * the shading normal outward with radius so the glass behaves like the lens it
+ * is drawn as. That one term is what turns a uniform disc into something with a
+ * dark middle and a live edge. Third, glass is a mirror: without something from
+ * the environment sliding across it as the weapon moves, no amount of tint will
+ * stop it reading as paint.
+ *
+ * The last fifth of the radius then vignettes hard into the housing, which is
+ * both true — the objective is recessed and the tube wall shades it — and the
+ * thing that stops the element ending on a punched-out circle.
  */
 function makeLensMaterial(tint: number): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     uniforms: {
       uTint: { value: new THREE.Color(tint).convertSRGBToLinear() },
-      uCore: { value: new THREE.Color(0x05090c).convertSRGBToLinear() },
+      uCore: { value: new THREE.Color(0x04070a).convertSRGBToLinear() },
       uSky: { value: new THREE.Color(0x9fc0e2).convertSRGBToLinear() },
+      uWarm: { value: new THREE.Color(0xffd7ab).convertSRGBToLinear() },
+      /**
+       * Sag of the faked spherical cap.
+       *
+       * This is the number that decides whether the sight reads as glass or as
+       * a lit disc, and it is easy to overshoot. At 2.6 the rim normal tilted
+       * 69 degrees, so on the far half of the element it crossed grazing
+       * against a hip-fire eyeline that is already 30 degrees off axis, the
+       * coating term saturated, and the objective filled with flat turquoise —
+       * the exact failure the curvature was added to cure. A red-dot objective
+       * is very nearly flat; 1.05 puts the rim at 46 degrees, which lights the
+       * meniscus and leaves the middle of the glass clear.
+       */
+      uCurve: { value: 1.05 },
     },
     vertexShader: /* glsl */ `
       varying vec3 vN;
       varying vec3 vV;
+      varying vec3 vTx;
+      varying vec3 vTy;
       varying vec2 vUvL;
       void main() {
         vec4 mv = modelViewMatrix * vec4( position, 1.0 );
         vN = normalize( normalMatrix * normal );
+        // The element's own tangent frame. Circle and plane geometry both map
+        // uv straight onto local X/Y, so these are the axes the radial term
+        // needs in order to tilt the normal in the right direction.
+        vTx = normalize( normalMatrix * vec3( 1.0, 0.0, 0.0 ) );
+        vTy = normalize( normalMatrix * vec3( 0.0, 1.0, 0.0 ) );
         vV = normalize( -mv.xyz );
         vUvL = uv * 2.0 - 1.0;
         gl_Position = projectionMatrix * mv;
@@ -636,28 +673,50 @@ function makeLensMaterial(tint: number): THREE.ShaderMaterial {
       uniform vec3 uTint;
       uniform vec3 uCore;
       uniform vec3 uSky;
+      uniform vec3 uWarm;
+      uniform float uCurve;
       varying vec3 vN;
       varying vec3 vV;
+      varying vec3 vTx;
+      varying vec3 vTy;
       varying vec2 vUvL;
       void main() {
-        // A real AR coating passes ~99% on axis; what you see is the residual
-        // blue-green reflection, which only shows up off-axis.
-        float f = pow( 1.0 - clamp( dot( normalize( vN ), normalize( vV ) ), 0.0, 1.0 ), 2.2 );
         float r = length( vUvL );
+        vec3 N = normalize( vN + ( vTx * vUvL.x + vTy * vUvL.y ) * uCurve );
+        vec3 V = normalize( vV );
+        float ndv = clamp( dot( N, V ), 0.0, 1.0 );
+        // Coating strength. Head-on this is a fraction of a percent; by the rim
+        // it is two hundred times that, which is the whole behaviour of an AR
+        // stack in one line.
+        float coat = pow( 1.0 - ndv, 3.0 );
 
-        // Sky reflection: one soft ellipse high on the glass, plus its faint
-        // secondary further down — the double bounce off a coated element.
-        float sweep = smoothstep( 0.92, 0.06, length( ( vUvL - vec2( -0.30, 0.40 ) ) * vec2( 1.0, 1.35 ) ) );
-        float sweep2 = smoothstep( 0.50, 0.02, length( vUvL - vec2( 0.34, -0.42 ) ) ) * 0.35;
+        // Environment. The broad term brightens wherever the mirrored ray
+        // points at sky, the tight one is a single hard glint — and because
+        // both ride the curved normal, both slide across the glass as the
+        // weapon moves instead of being painted on.
+        vec3 R = reflect( -V, N );
+        float sky = smoothstep( -0.35, 0.85, R.y );
+        float glint = pow( max( dot( R, normalize( vec3( -0.40, 0.62, 0.68 ) ) ), 0.0 ), 46.0 );
 
-        // Meniscus: the glass curves away into the housing and goes bright.
-        float rim = pow( smoothstep( 0.58, 1.0, r ), 2.4 );
+        // Vignette into the tube over the outer fifth.
+        float vig = smoothstep( 0.80, 1.0, r );
 
-        vec3 col = mix( uCore, uTint, f );
-        col += uSky * ( sweep * 0.20 + sweep2 * 0.12 ) * ( 0.35 + 0.85 * f );
-        col += mix( uTint, uSky, 0.45 ) * rim * 0.55;
+        vec3 col = uCore;
+        col += uTint * coat * 0.95;
+        // Almost none of the sky term is unconditional. A flat 0.04 with a
+        // flat 0.09 of opacity behind it is a *fill*, and it measured as one:
+        // an even 0.24-luma wash across the whole element regardless of where
+        // on the glass you looked. Nearly all of it now rides the coating term,
+        // so the reflection gathers toward the rim and the middle of the sight
+        // is the dark bore you are supposed to be looking down.
+        col += uSky * sky * ( 0.009 + 0.55 * coat );
+        col += uWarm * glint * 0.60;
+        col *= 1.0 - 0.90 * vig;
 
-        float a = clamp( 0.14 + 0.66 * f + sweep * 0.16 + sweep2 * 0.10 + rim * 0.42, 0.0, 1.0 );
+        // Opacity rises with everything that is a reflection and again at the
+        // vignette, so the rim genuinely occludes the bore behind it while the
+        // middle stays something you look *through*.
+        float a = clamp( 0.05 + 0.50 * coat + 0.06 * sky * coat + glint * 0.9 + 0.90 * vig, 0.0, 1.0 );
         gl_FragColor = vec4( col, a );
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
@@ -716,6 +775,18 @@ export interface WeaponMaterialSet {
 
 export class GunMaterials {
   readonly lens: THREE.ShaderMaterial;
+  /**
+   * The inside of an optic tube, and the reference black the glass is read
+   * against.
+   *
+   * A bore is flat-black anodised and ribbed *specifically* so that it returns
+   * nothing, and it is the darkest thing on the weapon by some way. Letting the
+   * housing material line it instead — near-neutral, part-metal, reflecting the
+   * same sky as everything else — is how a sight ends up reading as a bright
+   * ring with a mid-grey hole in it: with no interior shadow there is no depth
+   * behind the glass, and with no depth the lens is a disc.
+   */
+  readonly bore: THREE.MeshStandardMaterial;
   readonly flashTexture: THREE.DataTexture;
   readonly scopeShadow: THREE.DataTexture;
 
@@ -733,17 +804,37 @@ export class GunMaterials {
     this.metalPair = buildMetalDetail(size, aniso);
     this.polymerPair = buildPolymerDetail(size, aniso);
 
+    // Nomex, not skin. Two things were making the support arm read as "a smooth
+    // tan mass with a bright specular rim": it was lighter in value than the
+    // weapon it is holding, so the eye went to the arm instead of the gun, and
+    // at 0.86 environment intensity a nominally 0.93-rough glove still picked
+    // up a hard grazing sheen down its whole length. Darker, rougher, and with
+    // most of the reflection taken out — a glove is about the least reflective
+    // thing a soldier is wearing.
     this.glove = makeTriplanarMaterial(this.polymerPair, {
-      baseColor: 0x484238, wearColor: 0x6d675b,
-      baseRough: 0.93, wearRough: 0.76,
+      baseColor: 0x35302a, wearColor: 0x585245,
+      baseRough: 0.96, wearRough: 0.82,
       baseMetal: 0.0, wearMetal: 0.0,
-      wearBias: -0.06, wearGain: 0.66,
-      detailScale: 78, normalStrength: 1.10, envIntensity: 0.86,
-      desat: 0.92, ao: 0.38,
+      wearBias: -0.08, wearGain: 0.62,
+      detailScale: 78, normalStrength: 1.22, envIntensity: 0.36,
+      desat: 0.94, ao: 0.46,
     }, 'cod-gun-polymer');
     this.owned.push(this.glove);
 
-    this.lens = makeLensMaterial(0x2ee0c0);
+    // A coated element is a *sheen*, not a filter. The old 0x2ee0c0 was three
+    // quarters saturated and painted the whole disc turquoise; this is the same
+    // hue with roughly seventy per cent of that saturation taken out, so what
+    // survives is a blue-green cast on the reflection rather than a fill.
+    this.lens = makeLensMaterial(0x96c1b9);
+    this.bore = new THREE.MeshStandardMaterial({
+      color: 0x090a0b,
+      roughness: 0.95,
+      metalness: 0.0,
+      envMapIntensity: 0.05,
+      side: THREE.BackSide,
+      dithering: true,
+    });
+    this.owned.push(this.bore);
     this.flashTexture = buildFlashTexture();
     this.scopeShadow = buildScopeShadow();
   }
@@ -2061,8 +2152,10 @@ function makeReticleMesh(
     map: materials.reticle(kind),
     // Deliberately over unity: an illuminated reticle is an emitter, so its
     // core has to clip white and leave the hue in the skirt. At exactly 1.0 the
-    // dot renders as flat paint the colour of the LED.
-    color: new THREE.Color(color).multiplyScalar(2.6),
+    // dot renders as flat paint the colour of the LED. 2.6 was far enough over
+    // that the skirt clipped too and the whole emitter went white-hot; 1.9
+    // still blows the core and keeps the hue everywhere else.
+    color: new THREE.Color(color).multiplyScalar(1.9),
     transparent: true,
     opacity,
     blending: THREE.AdditiveBlending,
@@ -2244,6 +2337,17 @@ function buildOptic(
         sink.add(b, 'accent', 'body', 0.40);
       }
 
+      // Flat-black bore liner, sitting a fifth of a millimetre inside the
+      // housing's own wall. Everything you can see through the glass is this,
+      // and it has to be the darkest thing on the weapon or the sight has no
+      // interior and the lens has nothing to be in front of.
+      const boreGeo = new THREE.CylinderGeometry(rBore - 0.0002, rBore - 0.0002, len - 0.019, 26, 1, true);
+      boreGeo.rotateX(HALF_PI);
+      boreGeo.translate(0, sightY, z);
+      const boreMesh = new THREE.Mesh(boreGeo, materials.bore);
+      boreMesh.frustumCulled = false;
+      opticNode.add(boreMesh);
+
       // Glass. Objective and ocular are merged into one mesh so a second lens
       // costs geometry, not a draw call.
       const objGlass = new THREE.CircleGeometry(rBore + 0.0018, 28);
@@ -2266,8 +2370,14 @@ function buildOptic(
       // floats 1 mm proud of the rear element, where the collimated dot appears
       // to the shooter anyway, and the parallax shift reads as the dot sliding
       // across the glass exactly as it does on a real sight.
-      const r = makeReticleMesh(materials, 'dot', rBore * 2.1, v.reticleColor, 1.0);
-      r.mesh.position.set(0, sightY, z + L2 - 0.0054);
+      // Sized off the *dot*, not the bore. At 2.1 bore radii the emitter's
+      // skirt spanned most of the element and the sight read as a lit disc
+      // with a hot centre; at 1.4 the same texture lands as a small floating
+      // point of light with a little glow, which is what a collimated dot is.
+      // It also sits 1.5 mm proud of the rear element rather than on it, so the
+      // dot visibly floats in front of the glass instead of being printed on it.
+      const r = makeReticleMesh(materials, 'dot', rBore * 1.4, v.reticleColor, 1.0);
+      r.mesh.position.set(0, sightY, z + L2 - 0.0049);
       opticNode.add(r.mesh);
       out.reticleNode = r.mesh;
       out.reticleMaterial = r.material;
@@ -2472,75 +2582,199 @@ function buildOptic(
  * finger-shaped boxes glued on — and it costs the same. The caller rotates the
  * node to aim the palm wherever the grip actually is.
  */
-function buildWrapHand(
-  sink: PartSink, group: PartGroup, R: number, depth: number, wristDir: 1 | -1, forearm: boolean,
+/** Glove bevel. Soft enough to read as fabric, tight enough to keep a crease. */
+const GLOVE_BEVEL = 0.0010;
+
+/**
+ * Wrist end of a gloved hand: the gauntlet cuff, its stitched welt, and the
+ * seam where the glove stops and the sleeve starts.
+ *
+ * This assembly is doing most of the work of saying "glove". The old hand ended
+ * in a single smooth lathe cone with no cuff, no seam and no ring of any kind,
+ * which is why the whole limb read as one continuous putty mass with a
+ * specular highlight down it — there was no feature anywhere along its length
+ * for the eye to find a scale on.
+ */
+function buildCuff(
+  sink: PartSink, group: PartGroup, r: number, orient: (g: THREE.BufferGeometry) => void,
+  ox: number, oy: number, oz: number,
 ): void {
-  const palm = arcSector(R + 0.0175, R + 0.0012, -1.15, 2.30, depth, 0.0030, 12);
+  // Gauntlet: a short flare, faceted rather than lathed smooth.
+  const gauntlet = latheProfile([
+    [0, -0.0068], [r * 0.98, -0.0072], [r * 1.10, -0.0030],
+    [r * 1.08, 0.0044], [r * 0.94, 0.0070], [0, 0.0070],
+  ], 11);
+  orient(gauntlet); gauntlet.translate(ox, oy, oz);
+  sink.add(gauntlet, 'glove', group, 0.16);
+
+  // Proud welt: the double-stitched rolled edge of the cuff.
+  const welt = latheTube(r * 1.15, r * 0.92, 0.0030, 12, 0.0008);
+  orient(welt); welt.translate(ox, oy, oz);
+  sink.add(welt, 'glove', group, 0.34);
+
+  // Seam groove, on the dark material so it reads as a recess and not a line.
+  const seam = latheTube(r * 1.04, r * 0.90, 0.0016, 12, 0.0004);
+  orient(seam); seam.translate(ox, oy, oz);
+  sink.add(seam, 'polymer', group, 0.08);
+
+  // Adjuster tab and its buckle: the asymmetry that stops the cuff reading as
+  // a machined collar. Offset in the cuff's own frame before it is oriented, so
+  // the tab lies on the cuff wherever the caller has pointed the wrist.
+  const tab = bevelBox(0.0125, 0.0042, 0.0026, 0.0009, 0.0005);
+  tab.translate(r * 0.86, r * 0.52, 0);
+  orient(tab); tab.translate(ox, oy, oz);
+  sink.add(tab, 'glove', group, 0.30);
+  const buckle = bevelBox(0.0052, 0.0034, 0.0016, 0.0006, 0.0004);
+  buckle.translate(r * 1.02, r * 0.62, 0);
+  orient(buckle); buckle.translate(ox, oy, oz);
+  sink.add(buckle, 'accent', group, 0.44);
+}
+
+/**
+ * A gloved hand wrapped around a cylinder of radius `R` whose axis is +Z, palm
+ * centred on +X. Palm and fingers are arc sectors, which means the hand is
+ * genuinely curved around what it is holding rather than being a box with
+ * finger-shaped boxes glued on — and it costs the same. The caller rotates the
+ * node to aim the palm wherever the grip actually is.
+ *
+ * Three phalanges per finger, not two. Two segments give one crease, and one
+ * crease at this scale is a scratch; three give two creases plus a fingertip
+ * that steps down in radius, which is the minimum at which a finger reads as a
+ * finger rather than as a rib on a shell. The inter-finger gap is a real gap
+ * cut to nearly forty per cent of the pitch — fingers on a fat handguard do
+ * splay, and a modelled gap survives being blurred and lit from one side where
+ * a shading crease does not.
+ *
+ * `trigger` pulls the index finger off the wrap and stands it up on its own,
+ * which is the single most legible thing a firing hand can do.
+ */
+function buildWrapHand(
+  sink: PartSink, group: PartGroup, R: number, depth: number, wristDir: 1 | -1,
+  forearm: boolean, trigger = false,
+): void {
+  const palm = arcSector(R + 0.0172, R + 0.0012, -1.18, 2.32, depth, 0.0022, 14);
   sink.add(palm, 'glove', group, 0.05);
 
   // Heel of the hand: a thicker pad on the wrist side.
-  const heel = arcSector(R + 0.0205, R + 0.0060, -0.85, 1.70, depth * 0.34, 0.0026, 10);
+  const heel = arcSector(R + 0.0206, R + 0.0058, -0.88, 1.74, depth * 0.34, 0.0020, 12);
   heel.translate(0, 0, wristDir * depth * 0.30);
   sink.add(heel, 'glove', group, 0.08);
 
+  // Palm-panel seam: the welt down the outside edge of the hand where a
+  // shooting glove's palm and back panels are stitched together.
+  const panelSeam = arcSector(R + 0.0180, R + 0.0158, -1.10, 2.16, depth * 0.070, 0.0004, 12);
+  panelSeam.translate(0, 0, -wristDir * depth * 0.46);
+  sink.add(panelSeam, 'polymer', group, 0.30);
+
+  const pitch = depth * 0.238;
   for (let f = 0; f < 4; f++) {
     const t = f / 3;
     // Index nearest the wrist, pinky furthest: the natural hand rake.
-    const z = wristDir * (depth * 0.34 - t * depth * 0.72);
-    const reach = 1 - Math.abs(t - 0.28) * 0.26;
-    const width = depth * 0.20 * (1 - t * 0.18);
-    const rF = R + 0.0112 - t * 0.0008;
+    const isIndex = f === 0;
+    const z = wristDir * (depth * 0.345 - t * pitch * 3);
+    // Middle finger longest, index and pinky shorter — the rake that makes a
+    // hand read as a hand at a glance.
+    const reach = 1 - Math.abs(t - 0.30) * 0.22;
+    const width = pitch * (0.70 - t * 0.07);
+    // A trigger finger is not wrapped round anything: it comes off the front
+    // of the grip almost straight, so it stops after a third of the wrap and
+    // its knuckle stands proud of the rest of the fist.
+    const wrap = trigger && isIndex ? 0.34 : 1;
 
-    const proximal = arcSector(rF, R + 0.0010, 1.32, 1.55 * reach, width, 0.0022, 8);
-    proximal.translate(0, 0, z);
-    sink.add(proximal, 'glove', group, 0.10);
+    let a = 1.30;
+    let rOut = R + 0.0120 - t * 0.0009;
+    const spans = [1.02 * reach * wrap, 0.84 * reach * wrap, 0.62 * reach * wrap];
+    for (let p = 0; p < 3; p++) {
+      const span = spans[p]!;
+      const w = width * (1 - p * 0.075);
+      const seg = arcSector(rOut, R + 0.0009, a, span, w, GLOVE_BEVEL, 8);
+      seg.translate(0, 0, z);
+      sink.add(seg, 'glove', group, 0.10 + p * 0.05);
 
-    const distal = arcSector(rF - 0.0012, R + 0.0009, 1.32 + 1.55 * reach, 1.35 * reach, width * 0.94, 0.0020, 8);
-    distal.translate(0, 0, z);
-    sink.add(distal, 'glove', group, 0.16);
+      // Joint bead across the head of each phalanx. Its axis is the hand's
+      // width axis — the previous version rotated it a quarter turn onto the
+      // radial axis, which points a capsule straight out of the back of the
+      // hand and reads as a stud rather than as a knuckle.
+      const ja = a + span;
+      const jr = rOut - w * 0.10;
+      const bead = latheTube(w * 0.46, 0, w * 0.88, 9, w * 0.20);
+      bead.translate(Math.cos(ja) * jr, Math.sin(ja) * jr, z);
+      sink.add(bead, 'glove', group, 0.24 + p * 0.08);
 
-    // Knuckle: a small proud bead at the first joint, where gloves scuff.
-    const a = 1.32 + 1.55 * reach;
-    const knuckle = latheTube(width * 0.44, 0, width * 0.72, 10, width * 0.16);
-    knuckle.rotateY(HALF_PI);
-    knuckle.translate(Math.cos(a) * (rF + 0.0012), Math.sin(a) * (rF + 0.0012), z);
-    sink.add(knuckle, 'glove', group, 0.26);
+      // Hard knuckle pad over the first joint. Four separate pads on the dark
+      // material, one per finger, which is worth more than any amount of
+      // shading: it puts a hard value break exactly where the eye looks to
+      // count fingers, and it is what a tactical glove actually has.
+      if (p === 0) {
+        const pad = arcSector(rOut + 0.0016, rOut - 0.0004, a + span * 0.28, span * 0.62, w * 0.80, 0.0005, 6);
+        pad.translate(0, 0, z);
+        sink.add(pad, 'polymer', group, 0.46);
+      }
+
+      a += span;
+      rOut -= 0.0014;
+    }
+
+    // Fingertip: a smaller cap so the finger tapers instead of ending square.
+    const tip = latheTube(width * 0.38, 0, width * 0.74, 9, width * 0.24);
+    tip.translate(Math.cos(a) * (rOut + 0.0004), Math.sin(a) * (rOut + 0.0004), z);
+    sink.add(tip, 'glove', group, 0.40);
   }
 
-  // Thumb: crosses over the top of the grip beside the index finger.
-  let ang = 0.55;
+  // Knuckle ridge: the band of metacarpal heads across the back of the hand.
+  // One raised strip, and the thing that makes a fist read as a fist in
+  // silhouette rather than as a sleeve pulled over a pipe.
+  const ridge = arcSector(R + 0.0134, R + 0.0104, 1.16, 0.44, pitch * 3.24, 0.0009, 8);
+  ridge.translate(0, 0, wristDir * (depth * 0.345 - pitch * 1.5));
+  sink.add(ridge, 'glove', group, 0.34);
+
+  // Thumb: crosses over the top of the grip beside the index finger, in three
+  // parts so it has a joint of its own.
+  let ang = trigger ? 0.34 : 0.55;
   let rad = R + 0.0090;
-  for (let s = 0; s < 2; s++) {
-    const segLen = s === 0 ? 0.0235 : 0.0175;
-    const rr = 0.0080 - s * 0.0012;
+  for (let s = 0; s < 3; s++) {
+    const segLen = s === 0 ? 0.0180 : s === 1 ? 0.0150 : 0.0100;
+    const rr = 0.0082 - s * 0.0011;
     const seg = latheProfile([
-      [0, -segLen * 0.5], [rr, -segLen * 0.42], [rr * 0.90, segLen * 0.42], [0, segLen * 0.5],
-    ], 10);
+      [0, -segLen * 0.5], [rr, -segLen * 0.40], [rr * 0.94, segLen * 0.36],
+      [rr * 0.62, segLen * 0.5], [0, segLen * 0.5],
+    ], 9);
     seg.rotateY(HALF_PI);
     seg.rotateZ(ang);
     seg.translate(
       Math.cos(ang) * rad, Math.sin(ang) * rad,
-      wristDir * (depth * 0.40 - s * segLen * 0.55),
+      wristDir * (depth * 0.40 - s * segLen * 0.62),
     );
-    sink.add(seg, 'glove', group, 0.14);
-    ang += 0.34;
-    rad += 0.0022;
+    sink.add(seg, 'glove', group, 0.14 + s * 0.10);
+    ang += s === 0 ? 0.30 : 0.24;
+    rad += 0.0020;
   }
 
   if (!forearm) return;
 
-  // Forearm: tapers away from the wrist and leaves frame. The profile is
-  // authored extending toward +Z, so a -Z wrist needs it flipped.
+  const wristZ = wristDir * (depth * 0.5 + 0.0010);
+  const flip = (g: THREE.BufferGeometry): void => { if (wristDir < 0) g.rotateY(Math.PI); };
+
+  // Forearm: tapers away from the wrist and leaves frame. Nine lathe segments,
+  // not fourteen — at this size a faceted sleeve catches a different value on
+  // each facet, where a smooth one catches a single specular streak down its
+  // length and reads as moulded plastic.
   const arm = latheProfile([
-    [0, -0.0500], [0.0245, -0.0500], [0.0225, -0.0180], [0.0200, 0.0], [0, 0.0],
-  ], 14);
-  if (wristDir < 0) arm.rotateY(Math.PI);
-  arm.translate(R * 0.35, 0, wristDir * (depth * 0.5 + 0.0010));
+    [0, -0.0520], [0.0248, -0.0520], [0.0246, -0.0330], [0.0228, -0.0180],
+    [0.0232, -0.0120], [0.0205, 0.0], [0, 0.0],
+  ], 9);
+  flip(arm);
+  arm.translate(R * 0.35, 0, wristZ);
   sink.add(arm, 'glove', group, 0.06);
 
-  const cuff = latheTube(0.0250, 0.0205, 0.0090, 16, 0.0012);
-  cuff.translate(R * 0.35, 0, wristDir * (depth * 0.5 + 0.0130));
-  sink.add(cuff, 'glove', group, 0.26);
+  // Two sleeve creases, so the forearm has a scale on it.
+  for (let i = 0; i < 2; i++) {
+    const crease = latheTube(0.0242 - i * 0.0006, 0.0212, 0.0022, 10, 0.0006);
+    crease.translate(R * 0.35, 0, wristZ + wristDir * (0.0230 + i * 0.0140));
+    sink.add(crease, 'glove', group, 0.22);
+  }
+
+  buildCuff(sink, group, 0.0212, flip, R * 0.35, 0, wristZ + wristDir * 0.0112);
 }
 
 /**
@@ -2554,20 +2788,33 @@ function buildRightForearm(sink: PartSink, v: WeaponVisual): void {
   const wristY = gy - Math.cos(v.gripAngle) * v.gripLength * 0.20;
   const wristZ = gz + Math.sin(v.gripAngle) * v.gripLength * 0.20;
 
+  // This is the limb a critic measured as "a smooth tan mass with a bright
+  // specular rim": a fourteen-segment lathe cone with nothing on it between the
+  // wrist and the edge of frame. Faceted to nine, given a forearm swell rather
+  // than a straight taper, and broken up along its length.
+  const orient = (g: THREE.BufferGeometry): void => {
+    g.rotateX(-0.62);        // back and down, the natural shooting-arm angle
+    g.rotateY(-0.13);
+  };
+
   const arm = latheProfile([
-    [0, -0.1050], [0.0260, -0.1050], [0.0240, -0.0520], [0.0198, 0], [0, 0],
-  ], 14);
+    [0, -0.1050], [0.0268, -0.1050], [0.0264, -0.0760], [0.0242, -0.0520],
+    [0.0246, -0.0410], [0.0212, -0.0060], [0.0196, 0], [0, 0],
+  ], 9);
   arm.rotateY(Math.PI);      // taper runs back from the wrist
-  arm.rotateX(-0.62);        // back and down, the natural shooting-arm angle
-  arm.rotateY(-0.13);
+  orient(arm);
   arm.translate(0.0075, wristY - 0.0060, wristZ + 0.0080);
   sink.add(arm, 'glove', 'body', 0.06);
 
-  const cuff = latheTube(0.0252, 0.0206, 0.0095, 16, 0.0012);
-  cuff.rotateX(-0.62);
-  cuff.rotateY(-0.13);
-  cuff.translate(0.0075 + 0.0016, wristY - 0.0175, wristZ + 0.0245);
-  sink.add(cuff, 'glove', 'body', 0.26);
+  for (let i = 0; i < 2; i++) {
+    const crease = latheTube(0.0248 - i * 0.0008, 0.0218, 0.0024, 10, 0.0006);
+    crease.rotateY(Math.PI);
+    orient(crease);
+    crease.translate(0.0075 + 0.0022 + i * 0.0016, wristY - 0.0330 - i * 0.0180, wristZ + 0.0430 + i * 0.0230);
+    sink.add(crease, 'glove', 'body', 0.22);
+  }
+
+  buildCuff(sink, 'body', 0.0206, orient, 0.0075 + 0.0016, wristY - 0.0175, wristZ + 0.0245);
 }
 
 // ---------------------------------------------------------------------------
@@ -2693,7 +2940,7 @@ export class WeaponViewmodel {
       // so a rotation of (90 - gripAngle) about X puts it on the backstrap.
       const gy = visual.receiverY - visual.receiverHeight * 0.52;
       const gz = visual.receiverZ + visual.receiverLength * 0.30;
-      buildWrapHand(sink, 'rhand', 0.0135, 0.062, -1, false);
+      buildWrapHand(sink, 'rhand', 0.0135, 0.062, -1, false, true);
       buildRightForearm(sink, visual);
       nodes.rhand.position.set(
         0,

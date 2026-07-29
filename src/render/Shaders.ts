@@ -104,6 +104,30 @@ const vec3 ATM_UP = vec3( 0.0, 1.0, 0.0 );
 const vec3 ATM_TOTAL_RAYLEIGH = vec3( 5.804542996261093e-6, 1.3562911419845635e-5, 3.0265902468824876e-5 );
 const vec3 ATM_MIE_CONST = vec3( 1.8399918514433978e14, 2.7798023919660528e14, 4.0790479543861094e14 );
 
+/**
+ * Airborne dust, as a chroma pull on the finished Preetham radiance.
+ *
+ * Preetham fits clean sea-level air, and clean air at a 21-degree sun puts the
+ * anti-solar zenith at a scene-linear red-over-blue of 0.10 — twelve to one.
+ * No camera ever recorded that over a desert town, and it is measurable in the
+ * frame: the pose looking away from the sun came out at a whole-frame R/B of
+ * 0.91 while the pose looking into it came out at 1.18, a 29% spread that no
+ * single grade can bring inside a 1.00-1.20 band. Turbidity cannot fix it —
+ * raising it scales betaM and betaR together through the base term, and the ratio
+ * barely moves, because the chroma is coming from the pow(x, 1.5) on a term
+ * that already carries lambda^-4 twice over.
+ *
+ * Coarse dust is large compared to visible wavelengths, so it scatters almost
+ * neutrally and it is the dominant aerosol in this volume. Pulling the dome
+ * toward its own luminance, with a faint warm floor, is what that looks like.
+ * Luminance-preserving by construction — the tint's own luma is 1.008 — so this
+ * changes hue and nothing else: no exposure shift, no change to the glare
+ * fraction. It runs inside atmosphereRadiance so the dome, the aerial
+ * perspective, the SSR fallback and the CPU-side fog colour cannot disagree.
+ */
+const float ATM_DUST = 0.60;
+const vec3 ATM_DUST_TINT = vec3( 1.075, 1.0, 0.925 );
+
 float atmRayleighPhase( float c ) { return ( 3.0 / ( 16.0 * PST_PI ) ) * ( 1.0 + c * c ); }
 
 float atmMiePhase( float c, float g ) {
@@ -149,7 +173,10 @@ vec3 atmosphereRadiance( vec3 dir, vec3 sunDir, float turbidity, float rayleigh,
     sat( pow( 1.0 - dot( ATM_UP, sunDir ), 5.0 ) )
   );
 
-  return ( Lin + 0.1 * Fex ) * 0.04 + vec3( 0.0, 0.00035, 0.00085 );
+  vec3 col = ( Lin + 0.1 * Fex ) * 0.04 + vec3( 0.0, 0.00035, 0.00085 );
+  // Inline luma: this block is included by callers that do not all pull in
+  // POST_COMMON ahead of it.
+  return mix( col, vec3( dot( col, vec3( 0.2126, 0.7152, 0.0722 ) ) ) * ATM_DUST_TINT, ATM_DUST );
 }
 
 /**
@@ -692,6 +719,8 @@ uniform float uBaseHeight;
 uniform float uG;
 uniform float uMaxDistance;
 uniform float uFrame;
+uniform float uScatterKnee;
+uniform float uScatterMax;
 
 #if CSM_COUNT > 0
 uniform highp sampler2DShadow uShadow0;
@@ -771,7 +800,32 @@ void main() {
     if ( transmittance < 0.01 ) break;
   }
 
-  gl_FragColor = vec4( scatter * uSunColor, 1.0 );
+  vec3 lit = scatter * uSunColor;
+
+  // Roll the in-scatter, and this is the single largest fix in the frame.
+  //
+  // Measured on the hero pose: the sky dome renders 0.183 of scene radiance and
+  // this pass was adding 2.06 on top of it — a twelve-fold, sun-centred,
+  // R/B 1.75 veil laid over the entire windward half of the frame. That is what
+  // "the entire sun side is dissolved by veiling glare into featureless cream
+  // with zero sky detail" was, and it is also where most of a whole-frame R/B of
+  // 1.22 came from. The march itself is not wrong — 64m of dust at this density
+  // really does scatter that much into the forward lobe — it is that the *sky*
+  // it sits in front of is art-directed down to a roll maximum of 0.16 while the
+  // sun's directional intensity is still on a physical scale, so the two terms
+  // were never on the same footing.
+  //
+  // A flat clamp would put a plateau back around the sun, so this is the same
+  // hyperbolic roll the dome uses: everything under the knee — every faint shaft
+  // through an alley mouth, which is what this pass is actually for — passes
+  // through untouched, and only the forward-lobe core is compressed, keeping a
+  // gradient all the way up instead of a hole.
+  float range = max( 1e-4, uScatterMax - uScatterKnee );
+  vec3 over = max( vec3( 0.0 ), lit - uScatterKnee );
+  vec3 rolled = uScatterKnee + range * ( over / ( over + range ) );
+  lit = mix( lit, rolled, step( vec3( uScatterKnee ), lit ) );
+
+  gl_FragColor = vec4( max( vec3( 0.0 ), lit ), 1.0 );
 }
 `;
 
@@ -862,7 +916,12 @@ void main() {
     optical = max( 0.0, optical - uFogStart * exp( -uFogHeightFalloff * hCam ) );
     float fog = 1.0 - exp( -uFogDensity * optical );
 
-    float aer = min( fog, 0.94 );
+    // Capped short of total substitution. At 0.94 the far end of the street was
+    // 94% sky radiance, so an arch opening and the wall it is cut into resolved
+    // to the same pixel — the frame lost its deepest hole exactly where the eye
+    // goes looking for depth. 0.86 is still unmistakably hazy and leaves a
+    // seventh of the surface's own value to separate a void from a solid.
+    float aer = min( fog, 0.86 );
 
     // Below a percent of haze the analytic sky evaluation cannot change the
     // pixel by a code value, and most of a street frame is inside that. Worth
@@ -874,24 +933,37 @@ void main() {
       // is a *flatter, greyer* version of the surface with the sky laid over it
       // — not the surface at full chroma under a wash. Doing only the wash is
       // what makes engine fog look like a coloured sheet of glass.
-      float ls = lumaOf( color );
-      color = mix( color, vec3( ls ), aer * uFogDesaturate );
-      // Contrast toward the local mean as well, so distant value structure
-      // compresses instead of staying razor sharp under a lifted sky.
-      color = mix( color, vec3( mix( ls, 0.5, 0.35 ) ), aer * 0.22 );
-
       // The haze itself is the sky radiance *along this pixel's view ray*, from
       // the exact function that draws the dome — same Preetham evaluation, same
       // roll, same horizon band. Not an approximation of it, and not a
       // CPU-fitted three-colour lerp: the far wall now fades into the pixel
-      // directly above it, whatever colour that pixel happens to be.
+      // directly above it, whatever colour that pixel happens to be. Evaluated
+      // first because the contrast term below needs its luminance.
       vec3 air = skyInDirection( rd );
+
+      float ls = lumaOf( color );
+      color = mix( color, vec3( ls ), aer * uFogDesaturate );
+      // Contrast compression toward the *air's* own luminance, not toward a
+      // constant. The old form pulled 35% of the way to 0.5 of scene radiance,
+      // which is four or five times anything in a shaded street: distance was
+      // adding brightness rather than substituting it, so every far surface
+      // arrived at the tone curve already lifted and the shoulder then flattened
+      // the lot to cream. Aerial perspective desaturates and flattens toward the
+      // sky; it does not glow.
+      color = mix( color, vec3( mix( ls, lumaOf( air ), 0.5 ) ), aer * 0.30 );
+
       color = mix( color, air, aer );
     }
   }
 
   if ( uVolumeEnabled > 0.5 ) {
-    color += texture2D( tVolume, vUv ).rgb;
+    // Halved again over the sky. The dome is a Preetham evaluation: it already
+    // integrates this exact forward scattering out to the top of the atmosphere,
+    // so adding a 64-metre dust column on top of it counts the aureole twice —
+    // and the sky is the one surface with no depth of its own to justify the
+    // extra path length. Not zeroed, because a shaft that stopped dead at a
+    // roofline would read as a cut-out rather than as air.
+    color += texture2D( tVolume, vUv ).rgb * ( isSky ? 0.5 : 1.0 );
   }
 
   // Alpha 0 marks "world"; the viewmodel pass overwrites it with 1.
@@ -1402,9 +1474,19 @@ void main() {
   // tint onto every sunlit surface in the game and never once fired the warm
   // one, which is why the sunlit half of a facade measured *bluer* than its own
   // shadow. Two ways to fix it; this is the one that keeps the numbers legible.
+  //
+  // The warm end also has to *start* in the highlights. At an onset of 0.44 the
+  // warm multiplier was already at half strength on anything above sRGB 0.62 —
+  // which on this map is the entire sunlit carriageway — so the sand rendered as
+  // one cream value across forty percent of the frame with no hue variation left
+  // in it, and whole-frame R/B measured 1.22. Moved to 0.58 it engages over the
+  // top two stops only. The cool end keeps its wide range: shade is most of a
+  // street canyon at this sun angle and it is the half of the split that has to
+  // carry, because a shadow tinted toward the sky is the thing that reads as
+  // light rather than as pigment.
   float l = lumaOf( pow( max( color, vec3( 0.0 ) ), vec3( 1.0 / 2.2 ) ) );
   vec3 shadowW = vec3( 1.0 - smoothstep( 0.0, 0.84, l ) );
-  vec3 highW = vec3( smoothstep( 0.44, 1.0, l ) );
+  vec3 highW = vec3( smoothstep( 0.58, 1.0, l ) );
   color *= mix( vec3( 1.0 ), uShadowTint, shadowW );
   color *= mix( vec3( 1.0 ), uHighlightTint, highW * 0.8 );
 
@@ -1427,6 +1509,7 @@ ${POST_COMMON}
 
 uniform sampler2D tDiffuse;
 uniform vec2 uResolution;
+uniform vec2 uAaTexel;
 uniform float uTime;
 uniform float uAberration;
 uniform float uDistortion;
@@ -1502,7 +1585,16 @@ void main() {
   // Barrel distortion, deliberately at the edge of perceptible.
   vec2 uvD = 0.5 + c * ( 1.0 + uDistortion * r2 );
 
-  vec3 color = uFxaa > 0.5 ? fxaaFilter( tDiffuse, uvD, texel ) : texture2D( tDiffuse, uvD ).rgb;
+  // FXAA runs at *output* texel spacing, not at the internal buffer's.
+  //
+  // The preset the whole review is captured on renders at 0.7 scale (less again
+  // if the adaptive controller has stepped down) and the final pass upscales to
+  // the canvas. A silhouette against the sky therefore reaches the viewer as a
+  // 1.4-pixel staircase, and an edge filter working in source texels smooths the
+  // half-pixel step it can see while leaving the one the screenshot actually
+  // shows. Because tDiffuse is bilinear, sampling at output spacing is exactly
+  // equivalent to running the filter on the upscaled frame, at no extra cost.
+  vec3 color = uFxaa > 0.5 ? fxaaFilter( tDiffuse, uvD, max( uAaTexel, texel ) ) : texture2D( tDiffuse, uvD ).rgb;
 
   // Radial chromatic aberration: zero at centre, grows with r^2. Applied as a
   // per-channel *delta* so it composes with the resolved (FXAA'd) colour rather

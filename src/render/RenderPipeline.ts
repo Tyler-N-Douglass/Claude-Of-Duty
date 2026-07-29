@@ -27,6 +27,15 @@ import {
 } from './Shaders';
 
 const BLOOM_LEVELS = 6;
+/**
+ * Per-octave upsample weights, finest add first.
+ *
+ * Index i is the weight with which bloom level i+1 is added back into level i,
+ * so the strength with which level k reaches the frame is the product of the
+ * first k entries: 0.68, 0.39, 0.19, 0.07, 0.02. That geometric falloff is what
+ * makes the chain read as a sun rather than as fog on the lens.
+ */
+const BLOOM_UP_WEIGHTS = [0.68, 0.58, 0.48, 0.38, 0.30] as const;
 /** How much of the GTAO term reaches the composite at full weight. */
 const AO_STRENGTH = 0.8;
 const MIN_ADAPTIVE_SCALE = 0.6;
@@ -481,13 +490,15 @@ export class RenderPipeline implements RenderSystem {
     this.mBloomPrefilter = this.makeMaterial(BLOOM_PREFILTER_FRAG, {
       tDiffuse: { value: null },
       uTexel: { value: new THREE.Vector2() },
-      // In exposed space. The diffuse sky now sits well under this and only the
-      // solar disc and the hottest cloud shoulders cross it — which is the
-      // difference between a sun with a bloom skirt and a uniformly glowing sky
-      // with a hole in it. The clamp is high because the disc is meant to
-      // dominate the chain; it is four pixels across.
-      uThreshold: { value: 5.0 },
-      uKnee: { value: 0.7 },
+      // In exposed space, so at the metered street exposure of ~4.5 this gate
+      // sits at roughly 2x scene-linear middle-grey-plus-two-stops: genuinely
+      // emissive or specular content only. The diffuse sky, cloud tops and
+      // sunlit plaster are all well beneath it, which is the difference between
+      // a sun with a bloom skirt and a uniformly glowing sky with a hole in it.
+      // The knee is tightened along with it so the gate is a gate and not a
+      // ramp that starts a stop and a half early.
+      uThreshold: { value: 8.5 },
+      uKnee: { value: 0.45 },
       uClamp: { value: 12.0 },
       uExposure: { value: 1.6 },
     });
@@ -500,8 +511,9 @@ export class RenderPipeline implements RenderSystem {
     this.mBloomUp = this.makeMaterial(BLOOM_UP_FRAG, {
       tDiffuse: { value: null },
       uTexel: { value: new THREE.Vector2() },
-      uRadius: { value: 0.85 },
-      uLevelWeight: { value: 0.72 },
+      uRadius: { value: 0.76 },
+      // Overwritten per level in renderBloom — see BLOOM_UP_WEIGHTS.
+      uLevelWeight: { value: 0.68 },
     });
     this.mBloomUp.blending = THREE.AdditiveBlending;
 
@@ -552,25 +564,45 @@ export class RenderPipeline implements RenderSystem {
       tDiffuse: { value: null },
       tBloom: { value: null },
       uExposure: { value: 1 },
-      uBloomStrength: { value: q.bloom ? 0.055 : 0 },
+      // Halved. Bloom is a lens artefact, not a light source; at 0.055 against
+      // a chain that was itself spreading a veil it was adding a visible lift to
+      // every bright region in the frame rather than a skirt to a few of them.
+      uBloomStrength: { value: q.bloom ? 0.026 : 0 },
       // Zero, and it stays zero. See the note in TONEMAP_FRAG: this uniform is
       // applied while the buffer is still display-linear, so any non-zero value
       // here becomes a floor two and a half stops higher than it reads. The
       // film black is uFilmBlack in the final pass.
       uLift: { value: new THREE.Vector3(0, 0, 0) },
-      uGamma: { value: new THREE.Vector3(1.0, 1.0, 1.015) },
-      // Near-neutral. With the split tone now firing on the correct end of the
-      // range, a global warm gain on top of it only pushes shadows back toward
-      // the warm side the split tone just took them off.
-      uGain: { value: new THREE.Vector3(1.012, 1.0, 0.986) },
+      uGamma: { value: new THREE.Vector3(1.0, 1.0, 1.005) },
+      // Neutral, and it has to be. Every one of these multipliers stacks with
+      // the split tone on *every* pixel, and a global R/B of 1.026 sitting
+      // under a highlight tint of 1.26 is how a golden-hour grade turns into a
+      // sepia filter: whole-frame red-over-blue measured 1.22 when anything
+      // over about 1.21 stops reading as warm light and starts reading as a
+      // single pigment laid over the whole image.
+      uGain: { value: new THREE.Vector3(1.004, 1.0, 0.997) },
       // Shadowed faces go cool, sunlit faces go warm, and the eye reads the
       // difference as light rather than as pigment — which is the whole trick,
       // because the pigment is then free to come down.
-      uShadowTint: { value: new THREE.Vector3(0.785, 0.945, 1.25) },
-      uHighlightTint: { value: new THREE.Vector3(1.13, 1.005, 0.845) },
+      //
+      // The separation is the point, not the absolute warmth. The highlight
+      // side used to run R/B 1.26 and engage from sRGB 0.44 up, which is most
+      // of a sunlit street: forty percent of the frame was one cream value.
+      // Halved in strength and moved up the range (see uHighlightTint's
+      // smoothstep in TONEMAP_FRAG), it now paints the top two stops only, and
+      // the shade keeps its full cool offset — so lit-vs-shade separation is
+      // still 1.6:1 in R/B while the frame as a whole comes back to neutral.
+      // Green sits well above red so the shade lands blue-cyan — the colour of
+      // the sky that is filling it — rather than the violet a symmetric
+      // red-down/blue-up pair produces. This is the half of the split that is
+      // allowed to get stronger: the frame's shadow fill comes off warm sand
+      // bounce, so without a cool offset here a shadow reads warmer than the
+      // key that is missing from it.
+      uShadowTint: { value: new THREE.Vector3(0.775, 0.95, 1.275) },
+      uHighlightTint: { value: new THREE.Vector3(1.045, 1.0, 0.95) },
       // Call of Duty's palette is far more desaturated than anyone remembers.
       // It earns its colour from the light, not from the materials.
-      uSaturation: { value: 0.88 },
+      uSaturation: { value: 0.845 },
       // Contrast, toe and shoulder are one design, solved together against the
       // scene's measured sun-to-shadow ratio: a surface three stops under the
       // key has to land near sRGB 0.10 while the key itself lands near 0.75,
@@ -580,15 +612,35 @@ export class RenderPipeline implements RenderSystem {
       uContrast: { value: 1.34 },
       uToe: { value: 0.64 },
       uToeKnee: { value: 0.078 },
-      uShoulder: { value: 0.655 },
-      // Pre-shoulder value that maps to display white. Only the solar disc and
-      // a surface looking straight at it get anywhere near it.
-      uWhitePoint: { value: 1.27 },
+      // The shoulder was a knee, and it was in the wrong place.
+      //
+      // At 0.655 with a white point of 1.27 the curve reached display white at
+      // a pre-shoulder value of 1.27 — which the contrast power hands it from a
+      // scene radiance of only about 1.4x middle grey. Everything above that
+      // was a flat plateau: three poses measured a 99th percentile of 0.998 and
+      // a quarter of the hero frame sat above sRGB 0.90 with no local contrast
+      // left in it. That is veiling glare, and it is what dissolved the sun
+      // side of the street into featureless cream.
+      //
+      // Dropped to 0.42 and given a white point far up the curve, the roll now
+      // spans four stops instead of half of one: scene 0.5 is untouched (0.475
+      // vs 0.480 — the midtones and therefore p50 do not move), sky lands at
+      // sRGB 0.81, a surface staring into the sun at 0.91, and the solar disc
+      // at 0.93. Nothing clips flat, so the aureole keeps its gradient and a
+      // shaded opening in a sunlit wall keeps a value of its own.
+      uShoulder: { value: 0.42 },
+      // Pre-shoulder value that maps to display white. Well past anything ACES
+      // can produce, which is deliberate: the shoulder's job here is compression
+      // across the whole highlight range, not a hard landing on 1.0.
+      uWhitePoint: { value: 12.0 },
     });
 
     this.mFinal = this.makeMaterial(FINAL_FRAG, {
       tDiffuse: { value: null },
       uResolution: { value: new THREE.Vector2() },
+      // Canvas texel size. Distinct from uResolution, which is the internal
+      // buffer's: the edge filter has to work at the spacing the player sees.
+      uAaTexel: { value: new THREE.Vector2() },
       uTime: { value: 0 },
       uAberration: { value: 0.0021 },
       uDistortion: { value: 0.035 },
@@ -619,7 +671,7 @@ export class RenderPipeline implements RenderSystem {
       // occluder, low enough that it never becomes a uniform veil. With the sun
       // ahead of the hero camera and 26 degrees off the street's axis, every
       // alley mouth and roofline gap on the east terrace throws one.
-      uDensity: { value: 0.0085 },
+      uDensity: { value: 0.0062 },
       // Shallower than before so the shafts survive up to roof height instead
       // of dying at head height; the medium is dust, and dust is well mixed.
       uHeightFalloff: { value: 0.055 },
@@ -627,6 +679,14 @@ export class RenderPipeline implements RenderSystem {
       uG: { value: 0.74 },
       uMaxDistance: { value: 64 },
       uFrame: { value: 0 },
+      // Where the in-scatter starts to roll, and what it asymptotes to, in
+      // scene-linear radiance. Sized against the dome, which rolls to 0.16: a
+      // shaft may be as bright as the sky it crosses and a little brighter, and
+      // it may not be twelve times the sky, which is what an unrolled forward
+      // lobe was delivering. Everything under the knee — the shafts through the
+      // alley mouths this pass exists for — is untouched.
+      uScatterKnee: { value: 0.045 },
+      uScatterMax: { value: 0.135 },
       uCascadeFar: { value: new THREE.Vector4(1e6, 1e6, 1e6, 1e6) },
     };
     for (let i = 0; i < cascades; i++) {
@@ -1091,7 +1151,7 @@ export class RenderPipeline implements RenderSystem {
       u.tDiffuse.value = resolved;
       u.tBloom.value = bloomTexture;
       u.uExposure.value = this.exposure * this.exposureBias;
-      u.uBloomStrength.value = bloomTexture ? 0.055 : 0;
+      u.uBloomStrength.value = bloomTexture ? 0.026 : 0;
       this.blit(this.mTonemap, tonemapTarget);
     }
 
@@ -1100,6 +1160,11 @@ export class RenderPipeline implements RenderSystem {
       const u = this.mFinal.uniforms;
       u.tDiffuse.value = tonemapTarget.texture;
       (u.uResolution.value as THREE.Vector2).set(w, h);
+      const dpr = this.renderer.getPixelRatio();
+      (u.uAaTexel.value as THREE.Vector2).set(
+        1 / Math.max(2, this.cssWidth * dpr),
+        1 / Math.max(2, this.cssHeight * dpr),
+      );
       u.uTime.value = ctx.time.elapsed;
       // MSAA is unavailable through render targets and the renderer is created
       // with antialias:false, so with TAA off FXAA is the only thing standing
@@ -1314,6 +1379,12 @@ export class RenderPipeline implements RenderSystem {
       if (m) (u[`uShadowMat${i}`].value as THREE.Matrix4).copy(m);
     }
 
+    // Deliberately not blurred. The dithered six-step march does leave some
+    // salt-and-pepper on a shadow boundary, but with the in-scatter now rolled
+    // to a fifteenth of what it was that noise is below a code value, and a
+    // bilateral pass over it costs two half-resolution blits with nine depth
+    // taps each — which on the software rasteriser the review is captured on is
+    // most of a frame. Measured: adding it took the capture from 40fps to 3.
     this.blit(mat, this.volumeRT!);
     return true;
   }
@@ -1340,11 +1411,20 @@ export class RenderPipeline implements RenderSystem {
 
     // Additive upsample straight back into the finer level: no extra buffers,
     // and each level keeps the tight core of the one below it.
+    //
+    // The weight is per level and it decays, which is the whole shape of the
+    // glare. A single constant across six octaves — 0.72 everywhere — is a flat
+    // distribution: the 1/64-resolution mip, whose every texel covers a 64-pixel
+    // block of screen, arrived at 19% of the finest one's strength, and 19% of a
+    // blown sun spread over a sixty-four-pixel kernel is not a skirt, it is a
+    // veil across an entire quadrant. Decaying, level 5 now lands at 2%: a tight
+    // intense core, a fast falloff, and a wide but genuinely faint skirt.
     for (let i = levels.length - 2; i >= 0; i--) {
       const from = levels[i + 1]!;
       const to = levels[i]!;
       const u = this.mBloomUp.uniforms;
       u.tDiffuse.value = from.texture;
+      u.uLevelWeight.value = BLOOM_UP_WEIGHTS[Math.min(i, BLOOM_UP_WEIGHTS.length - 1)];
       (u.uTexel.value as THREE.Vector2).set(1 / from.width, 1 / from.height);
       this.blit(this.mBloomUp, to, false);
     }

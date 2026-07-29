@@ -47,11 +47,65 @@ const HEMI_INTENSITY = 1.30;
  */
 const BOUNCE_FRACTION = 0.145;
 /**
- * The viewmodel rig's intensities were authored against the old exposure. The
- * pipeline now runs about two thirds of a stop darker so that the sun can be
- * brighter without clipping, and the weapon has to be told, or it sinks.
+ * The viewmodel rig, expressed the same way everything else here is: as
+ * fractions of the sun.
+ *
+ * The rig used to be authored in absolute units against an older exposure and
+ * then scaled by one blanket gain, which is why the weapon measured 0.06 on its
+ * receiver flank and 0.15 on its top rail — a quarter of a stop of separation
+ * between two faces ninety degrees apart, which is not form, it is a silhouette
+ * with a stripe on it. The fix is not "more light", it is *ratio*: the key goes
+ * up by two and a half times while the fill and the ambient come down slightly,
+ * so a sun-facing surface climbs into the mid range and a shadow-side surface
+ * stays where it was. Perpendicular faces then differ by well over a stop and
+ * the weapon's own shadow side still supplies the frame's true blacks.
+ *
+ * Because these are fractions, the whole rig tracks the sun: retime the day, or
+ * let another pass pull the warm cast out of `sunColor`, and the gun follows
+ * instead of fighting it.
  */
-const VIEW_LIGHT_GAIN = 1.5;
+const VIEW_KEY_FRACTION = 0.62;
+const VIEW_RIM_FRACTION = 0.17;
+/**
+ * The bounce and the sky ambient split the fill budget, and how they split it
+ * is the weapon's contribution to the frame's colour balance. Weighted toward
+ * the warm bounce, the shadow side of the receiver measured red-over-blue near
+ * 1.95 — a gun in a sepia photograph rather than a neutral object under a warm
+ * key. Most of that budget now sits on the cool side, which is also what a
+ * shadowed surface outdoors actually sees.
+ */
+const VIEW_FILL_FRACTION = 0.036;
+const VIEW_AMBIENT_FRACTION = 0.060;
+/**
+ * How far the viewmodel key is allowed to swing onto the real sun bearing.
+ *
+ * All the way is wrong: face the sun and the weapon goes fully backlit, which
+ * is honest and unreadable. None of the way is also wrong — a key that never
+ * moves is what makes a viewmodel read as a sticker pasted over the frame. Just
+ * over half, with a floor on how low the result may sit, keeps the sun's
+ * bearing legible while guaranteeing the gun is always keyed from above.
+ */
+const VIEW_KEY_SUN_BLEND = 0.48;
+/**
+ * Floor on how much of the key survives on the shoulder side of the weapon,
+ * against a top-face term of 0.80. 0.36 against 0.80 is 1.15 stops between two
+ * faces ninety degrees apart before the rim and the sky have said anything,
+ * which is the difference between a shape and a sticker.
+ */
+const KEY_MIN_LATERAL = 0.36;
+/**
+ * Floor on how much of the key must arrive from the *viewer's* side of the
+ * weapon, in camera space where +Z points back at the eye.
+ *
+ * A viewmodel is the one object in the frame the player cannot walk around, so
+ * it is the one object that may not be allowed to go contre-jour. 0.15 is a
+ * shallow front-three-quarter — enough that the near flank always carries a
+ * readable value, small enough that the key still reads as coming from the sun's
+ * side of the sky rather than from a lamp on the camera.
+ */
+const KEY_MIN_FRONTAL = 0.15;
+/** Sky fill colour, shared by the world hemisphere and the viewmodel rig. */
+const SKY_FILL_COLOR = 0x86a3c8;
 /** How far back along the sun ray each cascade's ortho camera sits. */
 const CASCADE_BACK_DISTANCE = 95;
 const MAX_SHADOW_LOCALS = 4;
@@ -65,6 +119,27 @@ const _forward = new THREE.Vector3();
 const _rot = new THREE.Matrix4();
 const _rotInv = new THREE.Matrix4();
 const _lightWorld = new THREE.Vector3();
+const _viewDir = new THREE.Vector3();
+const _viewCanon = new THREE.Vector3();
+const _viewLocal = new THREE.Vector3();
+const _parentInv = new THREE.Matrix4();
+const _camQuat = new THREE.Quaternion();
+const _camQuatInv = new THREE.Quaternion();
+
+/**
+ * Camera-space rest bearings for the viewmodel rig. -Z is down the bore, +Y up,
+ * +X to the player's right. The key sits over the left shoulder because that is
+ * the side the weapon's ejection port and charging handle live on, so the
+ * hardware that carries the most relief is the hardware that gets the light.
+ */
+const VIEW_KEY_REST = new THREE.Vector3(-0.50, 0.80, 0.34).normalize();
+/** Ahead, above and to the right: kicks the top edge away from the background. */
+const VIEW_RIM_DIR = new THREE.Vector3(0.60, 0.44, -0.76).normalize();
+/** Warm ground bounce, from below and slightly ahead. */
+const VIEW_FILL_DIR = new THREE.Vector3(0.34, -0.72, -0.36).normalize();
+/** Sand under a low sun; the sun's own hue is blended halfway into it. */
+const GROUND_BOUNCE_COLOR = new THREE.Color(0xffc48a);
+const WHITE = new THREE.Color(0xffffff);
 
 export interface CascadeInfo {
   readonly light: THREE.DirectionalLight;
@@ -133,15 +208,21 @@ export class LightingSystem implements System {
   private lastPreparedFrame = -1;
   private shadowsEnabled = true;
   private viewRigChecked = false;
-  private viewSun: THREE.DirectionalLight | null = null;
-  private viewFill: THREE.HemisphereLight | null = null;
+  private viewOwnsRig = false;
+  private viewOwnsFill = false;
   /**
-   * Viewmodel lights the weapon system brought with it. This system does not
-   * own their positions or their ratios — that rig is authored around the gun —
-   * but it does own how much light the player is standing in, so it scales
-   * them all by the same sun-exposure factor the built-in rig uses.
+   * The viewmodel's three-point rig, whether this system built it or adopted
+   * one the weapon system brought with it.
+   *
+   * Adopting rather than adding is deliberate: a second set of directional
+   * lights in the view scene would change every viewmodel shader's light count
+   * for no visual gain. Roles are assigned by brightness, which is how a
+   * three-point rig is defined in the first place.
    */
-  private readonly borrowedViewLights: { light: THREE.Light; base: number }[] = [];
+  private viewKey: THREE.DirectionalLight | null = null;
+  private viewRim: THREE.DirectionalLight | null = null;
+  private viewBounce: THREE.DirectionalLight | null = null;
+  private viewFill: THREE.HemisphereLight | null = null;
   private viewSunExposure = 1;
   private viewSunTarget = 1;
   private viewSunProbeCountdown = 0;
@@ -195,7 +276,7 @@ export class LightingSystem implements System {
     // read warm, and that warm/cool split across a single object is most of
     // what people actually mean by "cinematic". The previous 0xcdd4de at 0.55
     // was neither — near-white and loud enough to flatten the whole canyon.
-    const skyFill = new THREE.Color(0x86a3c8);
+    const skyFill = new THREE.Color(SKY_FILL_COLOR);
     const groundFill = sky ? new THREE.Color().copy(sky.groundColor) : new THREE.Color(0x6b5a44);
     const gm = Math.max(groundFill.r, groundFill.g, groundFill.b, 1e-3);
     if (gm > 1) groundFill.multiplyScalar(1 / gm);
@@ -356,7 +437,12 @@ export class LightingSystem implements System {
   /**
    * The viewmodel lives in its own scene with its own camera, so unless it is
    * given a matching rig it ends up lit by nothing and reads as a sticker.
-   * Only installs a rig if the weapon system did not bring its own.
+   *
+   * Whatever rig it ends up with, this system drives it, because the weapon has
+   * to sit in the same light as the world: the same sun colour on its lit side,
+   * the same sky colour on its top surfaces, and the same brightness relative to
+   * the key. Hard-coded viewmodel colours are how a gun ends up warmer than the
+   * street it is standing in.
    */
   ensureViewmodelLighting(ctx: GameContext): void {
     if (this.viewRigChecked) return;
@@ -364,35 +450,81 @@ export class LightingSystem implements System {
 
     const sky = ctx.system<SkySystem>('sky');
     if (ctx.viewScene.environment === null) ctx.viewScene.environment = ctx.environment;
-    ctx.viewScene.environmentIntensity = (sky ? sky.environmentIntensity : 0.92) * 0.7;
+    // The gun's only reflection source. It carries the grazing sheen along the
+    // chamfers, which is a large part of why the metal reads as metal at all.
+    ctx.viewScene.environmentIntensity = (sky ? sky.environmentIntensity : 0.92) * 0.82;
 
+    const directionals: THREE.DirectionalLight[] = [];
     ctx.viewScene.traverse((o) => {
       const l = o as THREE.Light;
-      if (l.isLight === true) this.borrowedViewLights.push({ light: l, base: l.intensity });
+      if (l.isLight !== true) return;
+      if ((l as THREE.DirectionalLight).isDirectionalLight === true) {
+        directionals.push(l as THREE.DirectionalLight);
+      } else if ((l as THREE.HemisphereLight).isHemisphereLight === true && !this.viewFill) {
+        this.viewFill = l as THREE.HemisphereLight;
+      }
     });
-    if (this.borrowedViewLights.length > 0) {
-      this.updateViewmodelRig(ctx);
-      return;
+
+    // Brightest is the key, then the rim, then the bounce — the definition of a
+    // three-point rig, so it survives the weapon system re-authoring its own.
+    directionals.sort((a, b) => b.intensity - a.intensity);
+    this.viewKey = directionals[0] ?? null;
+    this.viewRim = directionals[1] ?? null;
+    this.viewBounce = directionals[2] ?? null;
+
+    if (!this.viewKey) {
+      this.viewOwnsRig = true;
+      const key = new THREE.DirectionalLight(0xffffff, 1);
+      key.name = 'viewmodel-key';
+      key.castShadow = false;
+      ctx.viewScene.add(key, key.target);
+      this.viewKey = key;
+
+      const rim = new THREE.DirectionalLight(0xffffff, 1);
+      rim.name = 'viewmodel-rim';
+      rim.castShadow = false;
+      ctx.viewScene.add(rim, rim.target);
+      this.viewRim = rim;
+
+      if (!this.viewFill) {
+        const fill = new THREE.HemisphereLight(SKY_FILL_COLOR, 0x6b5a44, 0.3);
+        fill.name = 'viewmodel-ambient';
+        ctx.viewScene.add(fill);
+        this.viewFill = fill;
+        this.viewOwnsFill = true;
+      }
     }
-
-    const key = new THREE.DirectionalLight(0xffffff, this.sunIntensity);
-    key.name = 'viewmodel-key';
-    key.color.copy(this.sunColor);
-    key.castShadow = false;
-    ctx.viewScene.add(key);
-    ctx.viewScene.add(key.target);
-    this.viewSun = key;
-
-    const fill = new THREE.HemisphereLight(0x7d9cc6, 0x6b5a44, 0.16);
-    ctx.viewScene.add(fill);
-    this.viewFill = fill;
 
     this.updateViewmodelRig(ctx);
   }
 
+  /**
+   * Points a viewmodel light along a *world* direction, whichever space its
+   * parent happens to be in.
+   *
+   * The weapon system parents its rig to a node carrying the camera's world
+   * matrix, so a light hung under it is authored camera-relative; a rig this
+   * system builds itself hangs off the view scene and is authored in world
+   * space. Converting through the parent covers both without either side having
+   * to know about the other.
+   */
+  private aimViewLight(light: THREE.DirectionalLight, worldDir: THREE.Vector3): void {
+    _viewLocal.copy(worldDir);
+    const parent = light.parent;
+    if (parent && parent !== this.ctx?.viewScene) {
+      parent.updateMatrixWorld();
+      _parentInv.copy(parent.matrixWorld).invert();
+      _viewLocal.transformDirection(_parentInv);
+    }
+    light.position.copy(_viewLocal).multiplyScalar(4);
+    light.target.position.set(0, 0, 0);
+    light.updateMatrixWorld(true);
+    light.target.updateMatrixWorld(true);
+  }
+
   private updateViewmodelRig(ctx: GameContext): void {
-    const key = this.viewSun;
-    if (!key && this.borrowedViewLights.length === 0) return;
+    const key = this.viewKey;
+    if (!key) return;
 
     // The viewmodel casts and receives no world shadows, so instead the key is
     // dimmed when the player themselves is out of the sun. Without this the
@@ -410,22 +542,85 @@ export class LightingSystem implements System {
     }
     this.viewSunExposure += (this.viewSunTarget - this.viewSunExposure) * 0.12;
 
-    if (this.borrowedViewLights.length > 0) {
-      // Never fully dark: a weapon in shade is still lit by the sky and by
-      // bounce off the ground, which is what the 0.34 floor stands in for.
-      const k = (0.34 + 0.66 * this.viewSunExposure) * VIEW_LIGHT_GAIN;
-      for (const entry of this.borrowedViewLights) entry.light.intensity = entry.base * k;
+    // Direct terms follow the player into shade; the sky and the ground do not
+    // switch off when a building gets between the player and the sun, so their
+    // floor is much higher.
+    const direct = 0.26 + 0.74 * this.viewSunExposure;
+    const ambient = 0.62 + 0.38 * this.viewSunExposure;
+
+    ctx.camera.getWorldQuaternion(_camQuat);
+
+    // Key: the camera-space rest bearing rolled part-way onto the real sun, so
+    // the lit side of the weapon agrees with the lit side of the street.
+    _viewCanon.copy(VIEW_KEY_REST).applyQuaternion(_camQuat);
+    _viewDir.copy(_viewCanon).multiplyScalar(1 - VIEW_KEY_SUN_BLEND)
+      .addScaledVector(this.sunDirection, VIEW_KEY_SUN_BLEND)
+      .normalize();
+    // Then put the side-light and the front-light back, both at once.
+    //
+    // Two separate things go wrong when the sun is blended in, and they are on
+    // perpendicular axes, so they are clamped together in camera space and
+    // normalised once. Doing them as two sequential add-and-renormalise steps
+    // lets the second one partly undo the first.
+    //
+    // Azimuth: averaging two unit vectors that disagree in azimuth shortens the
+    // horizontal part and leaves the vertical alone, so blending a rest bearing
+    // over the player's shoulder with a sun off to their right produces a key
+    // pointing almost straight down. That lights the top rail and *neither*
+    // flank — which measured as a 2.4-stop drop off the spine onto a receiver
+    // side that had gone to 0.013, a hole rather than a surface.
+    //
+    // Depth: nothing used to constrain how far *behind* the weapon the key
+    // could swing, and the sun on this map is 34 degrees off the street's axis,
+    // so a player looking up the street is looking very nearly into it. The key
+    // then sat on the far side of the gun — measured as a dot with camera
+    // forward of +0.60 on the hero pose and +0.20 on the hip-fire pose, against
+    // -0.36 to -0.75 on the three poses that read correctly — and the weapon
+    // rendered as a black cut-out in exactly the two frames a viewmodel is
+    // judged on. The sun may swing the key around the weapon; it may not put it
+    // behind the weapon, and it may not flatten it onto the top.
+    _viewLocal.copy(_viewDir).applyQuaternion(_camQuatInv.copy(_camQuat).invert());
+    // Camera space: +X right, +Y up, -Z forward. Left shoulder is -X, so the
+    // shoulder floor is a ceiling on x; frontal is +z, so the depth cap is a
+    // floor on z.
+    if (_viewLocal.x > -KEY_MIN_LATERAL) _viewLocal.x = -KEY_MIN_LATERAL;
+    if (_viewLocal.z < KEY_MIN_FRONTAL) _viewLocal.z = KEY_MIN_FRONTAL;
+    _viewDir.copy(_viewLocal).normalize().applyQuaternion(_camQuat);
+    this.aimViewLight(key, _viewDir);
+    // The sun's own hue, pulled a quarter of the way to white. A phosphated
+    // receiver is a far weaker chroma amplifier than the sand and plaster the
+    // rest of the frame is made of, and the frame's warm-cast budget is nearly
+    // spent by the time it reaches the weapon: at the full sun colour the gun
+    // was the reddest object on screen, which is backwards.
+    key.color.copy(this.sunColor).lerp(WHITE, 0.25);
+    key.intensity = this.sunIntensity * VIEW_KEY_FRACTION * direct;
+
+    // Rim: cool, from ahead and above, opposite the key's shoulder. This is the
+    // skylight wrapping the top edge, and it is the term that separates the
+    // receiver's spine from whatever is behind it.
+    const rim = this.viewRim;
+    if (rim) {
+      _viewDir.copy(VIEW_RIM_DIR).applyQuaternion(_camQuat);
+      this.aimViewLight(rim, _viewDir);
+      rim.color.set(SKY_FILL_COLOR);
+      rim.intensity = this.sunIntensity * VIEW_RIM_FRACTION * (0.55 + 0.45 * this.viewSunExposure);
     }
-    if (!key) return;
 
-    key.position.copy(this.sunDirection).multiplyScalar(24).add(ctx.camera.position);
-    key.target.position.copy(ctx.camera.position);
-    key.color.copy(this.sunColor);
-    key.intensity = this.sunIntensity * this.viewSunExposure;
-    key.updateMatrixWorld(true);
-    key.target.updateMatrixWorld(true);
+    // Bounce: the same warm single-bounce the world gets, from below.
+    const bounce = this.viewBounce;
+    if (bounce) {
+      _viewDir.copy(VIEW_FILL_DIR).applyQuaternion(_camQuat);
+      this.aimViewLight(bounce, _viewDir);
+      bounce.color.copy(this.sunColor).lerp(GROUND_BOUNCE_COLOR, 0.5);
+      bounce.intensity = this.sunIntensity * VIEW_FILL_FRACTION * ambient;
+    }
 
-    if (this.viewFill) this.viewFill.intensity = 0.16 - 0.05 * this.viewSunExposure;
+    const fill = this.viewFill;
+    if (fill) {
+      fill.color.set(SKY_FILL_COLOR);
+      if (this.hemi) fill.groundColor.copy(this.hemi.groundColor);
+      fill.intensity = this.sunIntensity * VIEW_AMBIENT_FRACTION * ambient;
+    }
   }
 
   private updateLocals(camera: THREE.PerspectiveCamera): void {
@@ -569,15 +764,27 @@ export class LightingSystem implements System {
       this.hemi = null;
     }
 
-    if (this.viewSun && ctx) {
-      ctx.viewScene.remove(this.viewSun.target);
-      ctx.viewScene.remove(this.viewSun);
+    // Only tear down a rig this system actually created; an adopted one belongs
+    // to whoever built it and will be disposed by them.
+    if (this.viewOwnsRig) {
+      for (const l of [this.viewKey, this.viewRim, this.viewBounce]) {
+        if (!l) continue;
+        ctx?.viewScene.remove(l.target);
+        ctx?.viewScene.remove(l);
+        l.dispose();
+      }
     }
-    this.viewSun?.dispose();
-    this.viewSun = null;
-    if (this.viewFill && ctx) ctx.viewScene.remove(this.viewFill);
-    this.viewFill?.dispose();
+    if (this.viewOwnsFill && this.viewFill) {
+      ctx?.viewScene.remove(this.viewFill);
+      this.viewFill.dispose();
+    }
+    this.viewKey = null;
+    this.viewRim = null;
+    this.viewBounce = null;
     this.viewFill = null;
+    this.viewOwnsRig = false;
+    this.viewOwnsFill = false;
+    this.viewRigChecked = false;
 
     this.uninstallCsmPatch();
     this.ctx = null;
