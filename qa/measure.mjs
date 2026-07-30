@@ -125,6 +125,7 @@ function measure(png) {
   let n = 0;
   let band = 0;
   let clipped = 0;
+  let crushed = 0;
   let sumR = 0;
   let sumG = 0;
   let sumB = 0;
@@ -151,6 +152,10 @@ function measure(png) {
       // near-white with its local contrast washed away, so an arch opening and
       // the wall around it become the same value. Measure that, not clipping.
       if (l >= 0.90) clipped++;
+      // Crushed blacks. p1 alone is a trap: it rewards 0.000, which does not
+      // mean "a true black exists", it means pixels are sitting AT zero with
+      // their shadow detail already gone. Count them.
+      if (mx <= 2) crushed++;
       n++;
     }
   }
@@ -200,6 +205,7 @@ function measure(png) {
     midBandFraction: +(band / n).toFixed(4),
     meanSaturation: +(sumSat / n).toFixed(4),
     glareFraction: +(clipped / n).toFixed(4),
+    crushedFraction: +(crushed / n).toFixed(4),
     localContrast: +localContrast.toFixed(4),
     flatBrightFraction: +(flatBright / Math.max(tiles, 1)).toFixed(4),
     // Warm/cool balance of the whole frame. Golden hour should sit slightly
@@ -259,14 +265,14 @@ if (probeArg) {
 
 writeFileSync(resolve(dir, 'metrics.json'), JSON.stringify(results, null, 2));
 
-const HEAD = ['pose', 'p1', 'p50', 'p99', 'range', 'midBand', 'sat', 'glare', 'R/B', 'lcon', 'flat'];
+const HEAD = ['pose', 'p1', 'p50', 'p99', 'range', 'midBand', 'sat', 'glare', 'crush', 'lcon', 'flat'];
 const pad = (s, n) => String(s).padEnd(n);
 console.log(`\n${basename(dir)}`);
 console.log(HEAD.map((x, i) => pad(x, i === 0 ? 10 : 9)).join(''));
 for (const [name, m] of Object.entries(results)) {
   console.log(
     pad(name, 10) + [m.p1, m.p50, m.p99, m.dynamicRange, m.midBandFraction,
-                     m.meanSaturation, m.glareFraction, m.frameRedOverBlue, m.localContrast, m.flatBrightFraction]
+                     m.meanSaturation, m.glareFraction, m.crushedFraction, m.localContrast, m.flatBrightFraction]
       .map((v) => pad(v.toFixed(3), 9)).join(''),
   );
 }
@@ -288,13 +294,14 @@ if (vsDir) {
       pad(name, 10) +
         [d(m.p1, o.p1), d(m.p50, o.p50), d(m.p99, o.p99), d(m.dynamicRange, o.dynamicRange),
          d(m.midBandFraction, o.midBandFraction), d(m.meanSaturation, o.meanSaturation),
-         d(m.glareFraction, o.glareFraction), d(m.frameRedOverBlue, o.frameRedOverBlue),
+         d(m.glareFraction, o.glareFraction), d(m.crushedFraction, o.crushedFraction),
          d(m.localContrast, o.localContrast), d(m.flatBrightFraction, o.flatBrightFraction)]
           .map((v) => pad(v, 9)).join(''),
     );
   }
 }
 
-console.log(`\nTargets: p1 < 0.03 · range > 0.75 · midBand < 0.55 · glare < 0.06 · R/B 1.00-1.20 · lcon > 0.055 · flat < 0.10`);
+console.log(`\nTargets: p1 0.002-0.025 (low but NOT clipped) · range > 0.75 · midBand < 0.55`);
+console.log(`         glare < 0.06 · crush < 0.010 · lcon > 0.075 · flat < 0.10`);
 console.log(`midBand is the fraction of non-HUD pixels inside sRGB [0.13, 0.40] —`);
 console.log(`the rubric's "uniform mid-grey mush" failure expressed as a number.\n`);
