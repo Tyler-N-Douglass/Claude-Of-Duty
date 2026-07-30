@@ -35,7 +35,18 @@ const BLOOM_LEVELS = 6;
  * first k entries: 0.68, 0.39, 0.19, 0.07, 0.02. That geometric falloff is what
  * makes the chain read as a sun rather than as fog on the lens.
  */
-const BLOOM_UP_WEIGHTS = [0.68, 0.58, 0.48, 0.38, 0.30] as const;
+/**
+ * Per-level weight as the bloom chain is upsampled back.
+ *
+ * These are the shape of the skirt, and a near-flat distribution is what turns a
+ * bloom into a veil: with every mip landing at roughly the same weight, the
+ * coarsest level — a sixty-four-pixel blur of the whole frame — arrives at almost
+ * the same strength as the tightest one, and its contribution is by construction
+ * a smooth low-contrast sheet laid over everything bright. Rolled off steeply
+ * instead, the fine levels give the core and the coarse ones a skirt that is wide
+ * but faint, which is what a real lens does.
+ */
+const BLOOM_UP_WEIGHTS = [0.74, 0.50, 0.32, 0.20, 0.12] as const;
 /** How much of the GTAO term reaches the composite at full weight. */
 const AO_STRENGTH = 0.8;
 const MIN_ADAPTIVE_SCALE = 0.6;
@@ -465,10 +476,18 @@ export class RenderPipeline implements RenderSystem {
       // of that. Distance therefore reads as *air*, with the near-sun side of
       // the frame hazing warm and the away side hazing cool, and the ground
       // plane hazing harder than anything standing on it.
-      uFogDensity: { value: 0.0050 },
+      // Raised by half, and the volumetric pass paid for it. The frame's air was
+      // arriving almost entirely as an additive pedestal from the light-shaft
+      // march rather than as a blend toward the sky radiance along the ray, and
+      // those two forms are not interchangeable: for the same visible amount of
+      // haze the blend costs a fifth of the local contrast the pedestal costs,
+      // because it scales the surface's own signal instead of swamping it. With
+      // the double count gone this has to carry the atmosphere on its own, and
+      // now it can afford to.
+      uFogDensity: { value: 0.0075 },
       uFogHeightFalloff: { value: 0.1 },
       uFogBaseHeight: { value: -1.0 },
-      uFogStart: { value: 17 },
+      uFogStart: { value: 12 },
       uFogDesaturate: { value: 0.42 },
       // Saturation retained at any distance. Aerial perspective desaturates; it
       // does not bleach, and at zero the far end of the street stopped being
@@ -657,6 +676,12 @@ export class RenderPipeline implements RenderSystem {
       uVignette: { value: 0.4 },
       uGrain: { value: 0.026 },
       uSharpen: { value: 0.24 },
+      // Wide-radius local contrast. Radius in output pixels; the limit is the
+      // largest change it may make to a pixel, in display-linear, which is what
+      // stops it becoming a halo generator on a silhouette against the sky.
+      uClarity: { value: 0.95 },
+      uClarityRadius: { value: 5.5 },
+      uClarityLimit: { value: 0.045 },
       uFxaa: { value: 0 },
       // sRGB code 3 of 255, cool-tinted. A print black, not a lifted shadow.
       uFilmBlack: { value: 0.012 },
@@ -694,9 +719,24 @@ export class RenderPipeline implements RenderSystem {
       // shaft may be as bright as the sky it crosses and a little brighter, and
       // it may not be twelve times the sky, which is what an unrolled forward
       // lobe was delivering. Everything under the knee — the shafts through the
-      // alley mouths this pass exists for — is untouched.
-      uScatterKnee: { value: 0.045 },
-      uScatterMax: { value: 0.135 },
+      // alley mouths this pass exists for — is untouched. Brought down with the
+      // gain below, which now leaves far less for the roll to catch.
+      uScatterKnee: { value: 0.022 },
+      uScatterMax: { value: 0.062 },
+      // How much of the open-air in-scatter this pass keeps, and how much it
+      // keeps where the air is in full shadow.
+      //
+      // The composite's aerial perspective already delivers the unshadowed
+      // in-scatter — it blends toward the sky radiance along the ray, and that
+      // radiance is the same forward lobe this march integrates. Keeping all of
+      // it here billed the atmosphere twice, as a 0.056 pedestal over the whole
+      // distant third of the frame: measurably, a window reveal whose own
+      // radiance is 0.008 arrived at 0.064, and the same sunlit road surface fell
+      // from sd 0.019 near the camera to sd 0.009 at sixty metres. What is left
+      // is the part the analytic model cannot produce, the five-to-one ratio
+      // between lit and shadowed air, which is the shaft itself.
+      uShaftGain: { value: 0.30 },
+      uShaftAmbient: { value: 0.055 },
       uCascadeFar: { value: new THREE.Vector4(1e6, 1e6, 1e6, 1e6) },
     };
     for (let i = 0; i < cascades; i++) {

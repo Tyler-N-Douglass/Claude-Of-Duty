@@ -289,14 +289,21 @@ function buildReticleTexture(kind: ReticleKind, size = 256): THREE.DataTexture {
   switch (kind) {
     case 'dot':
       // Tight core, wide skirt — the shape a real emitter's bloom actually has,
-      // and the thing a uniform glow always gets wrong. The skirt was carrying
-      // nearly a tenth of full brightness out to a seventh of the plane, which
-      // through additive blending and the bloom pass came back as a soft blob
-      // the size of a thumbnail. Halved in gain and pulled in, so what survives
-      // the bloom is a hard point with a halo rather than a glowing lozenge.
-      dot(c, c, size * 0.026, size * 0.072, 0.045);
-      dot(c, c, size * 0.014, size * 0.024, 0.26);
-      dot(c, c, size * 0.008, size * 0.010, 1);
+      // and the thing a uniform glow always gets wrong.
+      //
+      // The previous radii were correct as a *texture* and wrong as an *image*.
+      // The dot plane lands at roughly 60 screen pixels against a 256 px texture,
+      // so the 0.008 core — two texels — resolved to half a screen pixel, and a
+      // half-pixel core drawn through a linear filter is averaged with the black
+      // around it until nothing is left. That is why the sight measured as an
+      // orange smudge rather than as an aiming point: the hard core was never
+      // actually drawn, only its skirt. Sized in *screen* pixels instead: the
+      // core is ~4 texels of that 60 px plane, so it lands as a 2 px point that
+      // clips white through the additive blend, with one tight halo behind it and
+      // one faint wide one carrying the LED's hue.
+      dot(c, c, size * 0.105, size * 0.085, 0.050);
+      dot(c, c, size * 0.038, size * 0.030, 0.30);
+      dot(c, c, size * 0.019, size * 0.012, 1);
       break;
     case 'holo':
       dot(c, c, size * 0.34, size * 0.10, 0.06);
@@ -478,6 +485,14 @@ const TRIPLANAR_ENV_FIX = /* glsl */ `
 }
 `;
 
+/** Scales a packed sRGB triple channel-wise. Used to derive one finish from another. */
+function scaleHex(hex: number, k: number): number {
+  const r = Math.round(Math.min(255, ((hex >> 16) & 0xff) * k));
+  const g = Math.round(Math.min(255, ((hex >> 8) & 0xff) * k));
+  const b = Math.round(Math.min(255, (hex & 0xff) * k));
+  return (r << 16) | (g << 8) | b;
+}
+
 export interface GunMaterialTuning {
   baseColor: number;
   wearColor: number;
@@ -610,25 +625,37 @@ function makeTriplanarMaterial(
 /**
  * Anti-reflective coated optic glass.
  *
- * The previous version was a flat disc filled with a saturated turquoise and
- * ringed with a hard bright annulus, and it read exactly as what it was: a
- * backlit plastic button. Three things were wrong and all three are geometric
- * rather than a matter of picking a nicer colour.
+ * Two critics have now judged this element and both were right about something.
+ * At a three-quarters-saturated 0x2ee0c0 filled across the disc it was "a
+ * uniformly bright cyan-turquoise disc, a backlit plastic button". Desaturated to
+ * 0x96c1b9 and multiplied by a hard vignette it became "a bright chrome ring over
+ * a dead dark disc" — the chrome being the housing's objective rim, the dead disc
+ * being this shader contributing almost nothing at all.
  *
- * First, the coating was a *fill*. A real AR stack passes about 99% on axis;
- * what the eye picks up is the residual reflection, and that residual is a
- * function of angle, so it must be near-absent looking down the tube and only
- * gather as the surface turns away. Second, the element is a spherical cap, and
- * a flat circle has no angle to gather against — hence `uCurve`, which bends
- * the shading normal outward with radius so the glass behaves like the lens it
- * is drawn as. That one term is what turns a uniform disc into something with a
- * dark middle and a live edge. Third, glass is a mirror: without something from
- * the environment sliding across it as the weapon moves, no amount of tint will
- * stop it reading as paint.
+ * Neither reading is about the tint, so no third tint would have fixed it. What
+ * makes glass read as glass is a *radial structure*, and there are four parts to
+ * it, in order from the middle out:
  *
- * The last fifth of the radius then vignettes hard into the housing, which is
- * both true — the objective is recessed and the tube wall shades it — and the
- * thing that stops the element ending on a punched-out circle.
+ *   1. A clear centre. A real AR stack passes about 99% on axis, so looking down
+ *      the tube you see the bore and not the coating. `uCurve` fakes the
+ *      spherical cap so the shading normal tilts outward with radius, which is
+ *      what gives the coating an angle to gather against at all; the Fresnel term
+ *      then rides that normal, and because it does, the environment reflection
+ *      *slides across the element* as the weapon moves instead of being painted
+ *      on. That motion is most of what sells it.
+ *   2. A coating meniscus. Between roughly half and four fifths of the radius the
+ *      glass has turned far enough that the residual reflection gathers into a
+ *      band, and that band is where the coating's colour lives. This is the part
+ *      the vignette was destroying: the old version multiplied the brightest ring
+ *      on the element by 0.10 and left nothing between the dark middle and the
+ *      housing.
+ *   3. A dark occluded ring at the joint. The element is bedded in the tube
+ *      behind a retaining lip; the last sixth of the radius is in that lip's
+ *      shadow, is nearly opaque, and is what stops the glass ending on a
+ *      punched-out circle. It also frames part 2, and a bright band needs a dark
+ *      edge outside it or it reads as a rim rather than as a reflection.
+ *   4. The bore behind all of it, which is a separate material (`GunMaterials.bore`)
+ *      and darker than anything this shader draws.
  */
 function makeLensMaterial(tint: number): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
@@ -696,27 +723,43 @@ function makeLensMaterial(tint: number): THREE.ShaderMaterial {
         // weapon moves instead of being painted on.
         vec3 R = reflect( -V, N );
         float sky = smoothstep( -0.35, 0.85, R.y );
-        float glint = pow( max( dot( R, normalize( vec3( -0.40, 0.62, 0.68 ) ) ), 0.0 ), 46.0 );
+        float glint = pow( max( dot( R, normalize( vec3( -0.40, 0.62, 0.68 ) ) ), 0.0 ), 52.0 );
 
-        // Vignette into the tube over the outer fifth.
-        float vig = smoothstep( 0.80, 1.0, r );
+        // The coating meniscus: an annulus, opening at half the radius and closed
+        // again before the retaining lip. Multiplying the coating by this rather
+        // than letting it run to the edge is what keeps the bright part of the
+        // glass *inside* the glass, where a reflection lives, instead of on the
+        // boundary, where it reads as chrome.
+        float band = smoothstep( 0.44, 0.74, r ) * ( 1.0 - smoothstep( 0.76, 0.90, r ) );
+        // Eye-relief vignette and the occluded joint, in one term: the outer
+        // sixth is in the lip's shadow and is essentially opaque.
+        float occl = smoothstep( 0.84, 1.0, r );
 
         vec3 col = uCore;
-        col += uTint * coat * 0.95;
+        // Two coating terms, and the split matters. The first is pure Fresnel and
+        // vanishes on axis, which is what an AR stack does. The second is the
+        // meniscus, weighted by Fresnel but not gated to zero by it, because the
+        // edge of a curved element is off-axis to you even when its centre is not
+        // — that residual is exactly the coloured ring you see on a real sight
+        // looking straight into it.
+        col += uTint * coat * 0.60;
+        col += uTint * band * ( 0.13 + 1.05 * coat );
         // Almost none of the sky term is unconditional. A flat 0.04 with a
         // flat 0.09 of opacity behind it is a *fill*, and it measured as one:
         // an even 0.24-luma wash across the whole element regardless of where
         // on the glass you looked. Nearly all of it now rides the coating term,
         // so the reflection gathers toward the rim and the middle of the sight
         // is the dark bore you are supposed to be looking down.
-        col += uSky * sky * ( 0.009 + 0.55 * coat );
-        col += uWarm * glint * 0.60;
-        col *= 1.0 - 0.90 * vig;
+        col += uSky * sky * ( 0.008 + 0.40 * coat + 0.30 * band );
+        col += uWarm * glint * 0.55;
+        col *= 1.0 - 0.94 * occl;
 
         // Opacity rises with everything that is a reflection and again at the
-        // vignette, so the rim genuinely occludes the bore behind it while the
+        // joint, so the lip genuinely occludes the bore behind it while the
         // middle stays something you look *through*.
-        float a = clamp( 0.05 + 0.50 * coat + 0.06 * sky * coat + glint * 0.9 + 0.90 * vig, 0.0, 1.0 );
+        float a = clamp(
+          0.045 + 0.44 * coat + 0.42 * band * ( 0.25 + coat ) + glint * 0.9 + 0.96 * occl,
+          0.0, 1.0 );
         gl_FragColor = vec4( col, a );
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
@@ -744,7 +787,13 @@ const METAL_TUNING: GunMaterialTuning = {
   // street. Part-metal gives the body something to be lit *by*.
   baseMetal: 0.62, wearMetal: 1.0,
   wearBias: -0.10, wearGain: 0.82,
-  detailScale: 84, normalStrength: 0.70, envIntensity: 1.05,
+  // Raised with the key cut. A parkerised receiver is supposed to be dark in
+  // diffuse and *varied* in specular, and with the rig's direct terms trimmed the
+  // only thing left that varies across a face at all is the environment: it is
+  // what puts a gradient down the length of the upper, a grazing sheen on each
+  // chamfer, and a different value on the rail's every tooth. Diffuse light
+  // cannot do any of those, which is why adding more of it flattened the gun.
+  detailScale: 84, normalStrength: 0.70, envIntensity: 1.40,
   desat: 0.86, ao: 0.30,
 };
 
@@ -762,14 +811,69 @@ const ACCENT_TUNING: GunMaterialTuning = {
   baseRough: 0.36, wearRough: 0.16,
   baseMetal: 0.76, wearMetal: 1.0,
   wearBias: -0.16, wearGain: 0.84,
-  detailScale: 96, normalStrength: 0.55, envIntensity: 1.00,
+  detailScale: 96, normalStrength: 0.55, envIntensity: 1.15,
   desat: 0.88, ao: 0.32,
+};
+
+/**
+ * The furniture: stock, cheek comb, grip panels.
+ *
+ * These were on the same material as the receiver's polymer, and it showed. A
+ * critic measured the stock as "a flat quad with a single linear gradient" and
+ * the reason it read that way is partly geometric and partly this: an identical
+ * albedo, an identical roughness and an identical detail scale to the part it is
+ * bolted to means the joint between the two is invisible, so the eye merges
+ * receiver and stock into one untextured mass and then has nothing left to look
+ * at but the value ramp across it.
+ *
+ * Real stock furniture is glass-filled nylon, moulded rather than machined:
+ * darker than a receiver's paint, noticeably rougher, and grained at a coarser
+ * scale because it comes out of a textured tool. Two thirds the albedo is the
+ * term that stops the stock being the brightest object on the weapon — on the
+ * previous build its top face measured 0.505 luma against a receiver at 0.13,
+ * which is nearly two stops the wrong way round.
+ */
+const STOCK_TUNING: GunMaterialTuning = {
+  baseColor: 0x2b2823, wearColor: 0x615b50,
+  baseRough: 0.82, wearRough: 0.58,
+  baseMetal: 0.015, wearMetal: 0.05,
+  // The gain matters more here than anywhere else on the weapon, and the reason
+  // is arithmetic. `codWear` is thresholded at smoothstep(0.30, 0.86); a chamfer
+  // on a part with a 0.11 wear floor stores about 0.73, and 0.73 * 0.66 * 0.95
+  // minus a 0.16 bias comes out at 0.30 — the very bottom of the threshold. So at
+  // the receiver's own settings the stock's edges produced *exactly zero* wear,
+  // which is precisely the "no wear" a critic reported. At 0.95 and -0.06 the
+  // chamfers land near 0.60 and pick up half the worn tint, while the flats still
+  // sit under the threshold and stay dark — rubbed edges on an unrubbed shell,
+  // which is how moulded furniture actually ages.
+  wearBias: -0.06, wearGain: 0.95,
+  detailScale: 74, normalStrength: 1.05, envIntensity: 0.72,
+  desat: 0.92, ao: 0.40,
+};
+
+/**
+ * Recoil pad rubber. The darkest material on the weapon and the flattest: a
+ * moulded butt pad returns almost nothing, which is precisely why it is worth
+ * having as its own material — it gives the silhouette's back end a true black
+ * to end on, so the stock stops being one continuous slab running out of frame.
+ */
+const RUBBER_TUNING: GunMaterialTuning = {
+  baseColor: 0x191817, wearColor: 0x3a3733,
+  baseRough: 0.94, wearRough: 0.80,
+  baseMetal: 0.0, wearMetal: 0.0,
+  // High enough to clear the wear threshold on the checkering's tooth tops, which
+  // is where a butt pad polishes first and the only place on it worth polishing.
+  wearBias: -0.04, wearGain: 0.80,
+  detailScale: 132, normalStrength: 1.30, envIntensity: 0.26,
+  desat: 0.95, ao: 0.44,
 };
 
 export interface WeaponMaterialSet {
   metal: THREE.MeshStandardMaterial;
   polymer: THREE.MeshStandardMaterial;
   accent: THREE.MeshStandardMaterial;
+  stock: THREE.MeshStandardMaterial;
+  rubber: THREE.MeshStandardMaterial;
   glove: THREE.MeshStandardMaterial;
 }
 
@@ -821,11 +925,13 @@ export class GunMaterials {
     }, 'cod-gun-polymer');
     this.owned.push(this.glove);
 
-    // A coated element is a *sheen*, not a filter. The old 0x2ee0c0 was three
-    // quarters saturated and painted the whole disc turquoise; this is the same
-    // hue with roughly seventy per cent of that saturation taken out, so what
-    // survives is a blue-green cast on the reflection rather than a fill.
-    this.lens = makeLensMaterial(0x96c1b9);
+    // A coated element is a *sheen*, not a filter — but once the sheen is
+    // confined to the meniscus it can afford chroma again, and it needs some:
+    // 0x96c1b9 is the colour of dust on glass, and confined to a band it
+    // disappeared entirely. Roughly half way back toward the original turquoise,
+    // which is about where a real green-tinged AR stack sits, and now it is the
+    // *band* carrying it rather than the whole disc.
+    this.lens = makeLensMaterial(0x5fcbb6);
     this.bore = new THREE.MeshStandardMaterial({
       color: 0x090a0b,
       roughness: 0.95,
@@ -848,9 +954,17 @@ export class GunMaterials {
       metal: makeTriplanarMaterial(this.metalPair, { ...METAL_TUNING, baseColor: v.metalColor }, 'cod-gun-metal'),
       polymer: makeTriplanarMaterial(this.polymerPair, { ...POLYMER_TUNING, baseColor: v.polymerColor }, 'cod-gun-polymer'),
       accent: makeTriplanarMaterial(this.metalPair, { ...ACCENT_TUNING, baseColor: v.accentColor }, 'cod-gun-accent'),
+      // The furniture tint is derived from the weapon's own polymer rather than
+      // authored per weapon: two thirds of its value, so a weapon that ships in
+      // FDE gets FDE furniture a stop darker instead of everybody's stock going
+      // the same grey.
+      stock: makeTriplanarMaterial(
+        this.polymerPair, { ...STOCK_TUNING, baseColor: scaleHex(v.polymerColor, 0.70) }, 'cod-gun-polymer',
+      ),
+      rubber: makeTriplanarMaterial(this.polymerPair, RUBBER_TUNING, 'cod-gun-polymer'),
       glove: this.glove,
     };
-    this.owned.push(set.metal, set.polymer, set.accent);
+    this.owned.push(set.metal, set.polymer, set.accent, set.stock, set.rubber);
     this.variants.set(key, set);
     return set;
   }
@@ -951,6 +1065,28 @@ function roundedRectPath(w: number, h: number, r: number): THREE.Path {
   return p;
 }
 
+/**
+ * The same hole, off-centre. Two lightening slots side by side through one plate
+ * need this; a single centred hole does not, which is why it did not exist.
+ */
+function roundedRectPathAt(w: number, h: number, r: number, cx: number, cy: number): THREE.Path {
+  const hw = w * 0.5;
+  const hh = h * 0.5;
+  const rad = Math.max(0, Math.min(r, hw - 1e-4, hh - 1e-4));
+  const p = new THREE.Path();
+  p.moveTo(cx - hw + rad, cy - hh);
+  p.lineTo(cx + hw - rad, cy - hh);
+  if (rad > 1e-5) p.quadraticCurveTo(cx + hw, cy - hh, cx + hw, cy - hh + rad);
+  p.lineTo(cx + hw, cy + hh - rad);
+  if (rad > 1e-5) p.quadraticCurveTo(cx + hw, cy + hh, cx + hw - rad, cy + hh);
+  p.lineTo(cx - hw + rad, cy + hh);
+  if (rad > 1e-5) p.quadraticCurveTo(cx - hw, cy + hh, cx - hw, cy + hh - rad);
+  p.lineTo(cx - hw, cy - hh + rad);
+  if (rad > 1e-5) p.quadraticCurveTo(cx - hw, cy - hh, cx - hw + rad, cy - hh);
+  p.closePath();
+  return p;
+}
+
 interface ExtrudeOpts {
   bevel?: number;
   segments?: number;
@@ -977,6 +1113,44 @@ function extrude(shape: THREE.Shape, depth: number, opts: ExtrudeOpts = {}): THR
 
 function bevelBox(w: number, h: number, d: number, corner = 0.0022, bevel = BEVEL): THREE.BufferGeometry {
   return extrude(roundedRectShape(w, h, corner), d, { bevel });
+}
+
+/**
+ * Rectangle with its four corners cut off at 45 degrees: an octagon.
+ *
+ * `roundedRectShape` fillets a corner, which is right for a moulded part and
+ * wrong for a long arris. A fillet of radius r turns the edge into a curve whose
+ * highlight is a smooth ramp — under a raking key it either catches nothing or
+ * catches a soft smear — and at the four-segment curve resolution these
+ * extrusions use, it also visibly facets. A 45-degree chamfer of the same size
+ * gives the edge a *flat*, and a flat has one normal, so it catches one discrete
+ * highlight of its own value between the two faces it separates. That is the
+ * difference between "hard unbeveled arris" and "a rolled highlight", and at
+ * 1.5 mm across it is four or five screen pixels wide on a stock this close to
+ * the camera — enough to read as a machined edge rather than as a shading trick.
+ */
+function chamferShape(w: number, h: number, chamfer: number): THREE.Shape {
+  const hw = w * 0.5;
+  const hh = h * 0.5;
+  const k = Math.max(1e-4, Math.min(chamfer, hw * 0.6, hh * 0.6));
+  const s = new THREE.Shape();
+  s.moveTo(-hw + k, -hh);
+  s.lineTo(hw - k, -hh);
+  s.lineTo(hw, -hh + k);
+  s.lineTo(hw, hh - k);
+  s.lineTo(hw - k, hh);
+  s.lineTo(-hw + k, hh);
+  s.lineTo(-hw, hh - k);
+  s.lineTo(-hw, -hh + k);
+  s.closePath();
+  return s;
+}
+
+/** Box with a real 45-degree chamfer down all four long edges. */
+function chamferBar(
+  w: number, h: number, d: number, chamfer = 0.0015, bevel = BEVEL,
+): THREE.BufferGeometry {
+  return extrude(chamferShape(w, h, chamfer), d, { bevel });
 }
 
 /** Box with a rectangular hole punched clean through: magwells, port frames. */
@@ -1111,7 +1285,7 @@ function knurledCap(rOut: number, depth: number, teeth: number): THREE.BufferGeo
 // Part accumulation and merging
 // ---------------------------------------------------------------------------
 
-export type MatKey = 'metal' | 'polymer' | 'accent' | 'glove';
+export type MatKey = 'metal' | 'polymer' | 'accent' | 'stock' | 'rubber' | 'glove';
 export type PartGroup =
   | 'body' | 'mag' | 'bolt' | 'charge' | 'trigger' | 'dust' | 'lhand' | 'rhand' | 'selector';
 
@@ -1575,7 +1749,11 @@ function buildGrip(sink: PartSink, v: WeaponVisual): void {
   grip.rotateY(HALF_PI);
   grip.rotateX(-v.gripAngle);
   grip.translate(0, gy, gz);
-  sink.add(grip, 'polymer', 'body', 0.07);
+  // Furniture, not receiver. A pistol grip is the same moulded nylon the stock
+  // is, and putting it on the same material as the upper is part of why the whole
+  // weapon read as one undifferentiated dark mass — the finger ridges below stay
+  // on the receiver's polymer, so the grip now has a value break of its own.
+  sink.add(grip, 'stock', 'body', 0.07);
 
   const ca = Math.cos(-v.gripAngle);
   const sa = Math.sin(-v.gripAngle);
@@ -1945,31 +2123,121 @@ function buildStock(sink: PartSink, v: WeaponVisual): void {
   const y = v.receiverY - v.stockDrop;
 
   switch (v.stock) {
+    /**
+     * A collapsible stock, and the single most-looked-at 250 x 130 pixels of
+     * every frame this game renders: it sits in the bottom corner where the eye
+     * rests, closer to the camera than anything else on the weapon, and the
+     * viewmodel's own foreshortening turns its cheek comb into a long unbroken
+     * plane pointing at the lens.
+     *
+     * A critic measured that plane as "a flat quad with a single linear gradient,
+     * a hard unbeveled top arris, no butt pad, no sling loop, no cheek riser, no
+     * wear". Most of those parts did in fact exist; the point was that at this
+     * distance none of them was doing anything. The comb was one 23 x 75 mm
+     * `bevelBox`, which at a fifth of a metre is roughly 90 x 300 screen pixels
+     * of a single value with a 1.1 mm fillet at its edge, and a fillet that small
+     * on a plane that large is a shading artefact rather than an edge. So:
+     *
+     *   - the comb is two tiers, each chamfered at 1.5 mm, which gives the top of
+     *     the stock five distinct planes across its width instead of one, and
+     *     puts a flat on every arris for the raking key to catch;
+     *   - the flanks carry real lightening slots — holes through the side skins
+     *     you can see the buffer tube through, not painted rectangles;
+     *   - the butt is a rubber pad on its own material with moulded checkering
+     *     and a separate hard backing plate;
+     *   - a QD sling socket and a fixed loop, both of which read at this scale;
+     *   - and the whole assembly is on the furniture material, so the joint
+     *     between stock and receiver is a material change and not just a corner.
+     */
     case 'collapsible': {
       const tube = latheTube(0.0142, 0.0110, len * 0.92, 18, 0.0010);
       tube.translate(0, y, zBack + len * 0.46);
       sink.add(tube, 'metal', 'body', 0.20);
-      // The body slides on the tube: a frame plate whose hole runs along it.
-      const body = framePlate(0.0300, 0.0330, len * 0.58, 0.0230, 0.0240, 0.0035, 0.0022);
-      body.translate(0, y - 0.0020, zBack + len * 0.62);
-      sink.add(body, 'polymer', 'body', 0.07);
-      const cheek = bevelBox(0.0230, 0.0110, len * 0.50, 0.0028);
-      cheek.translate(0, y + 0.0160, zBack + len * 0.58);
-      sink.add(cheek, 'polymer', 'body', 0.14);
+      // Castle nut and end plate where the tube threads into the receiver: two
+      // hard-edged metal features right at the joint, which is the first thing
+      // the eye follows back from the receiver.
+      for (const g of ribbedRings(0.0158, 0.0010, 4, 0.0034, 0.0020, 12)) {
+        g.translate(0, y, zBack + 0.0092);
+        sink.add(g, 'metal', 'body', 0.30);
+      }
 
-      // Buttpad with a proper toe and heel, and a hard backing plate behind the
-      // rubber. A single slab there was the largest unbroken mass on screen.
-      const pad = bevelBox(0.0330, 0.0420, 0.0112, 0.0038);
-      pad.translate(0, y - 0.0010, zBack + len * 0.93);
-      sink.add(pad, 'polymer', 'body', 0.44);
-      const backing = bevelBox(0.0300, 0.0400, 0.0044, 0.0030);
-      backing.translate(0, y - 0.0010, zBack + len * 0.88);
+      // The body slides on the tube: a frame plate whose hole runs along it.
+      const bodyLen = len * 0.58;
+      const bodyZ = zBack + len * 0.62;
+      const body = framePlate(0.0272, 0.0330, bodyLen, 0.0230, 0.0240, 0.0035, 0.0022);
+      body.translate(0, y - 0.0020, bodyZ);
+      sink.add(body, 'stock', 'body', 0.07);
+
+      // Side skins, proud of the body and pierced twice each. Two 15 x 10 mm
+      // windows through a 2.2 mm skin, with the body's own wall 2 mm behind them:
+      // a recess with a hard edge and its own occlusion, which is what a moulded
+      // lightening slot looks like from outside. It is the reason the flank reads
+      // as a shell rather than as a block.
+      const skin = roundedRectShape(bodyLen * 0.92, 0.0288, 0.0034);
+      skin.holes.push(roundedRectPathAt(0.0150, 0.0104, 0.0022, -bodyLen * 0.20, 0.0016));
+      skin.holes.push(roundedRectPathAt(0.0150, 0.0104, 0.0022, bodyLen * 0.20, 0.0016));
+      for (const s of [-1, 1]) {
+        const plate = extrude(skin, 0.0022, { bevel: 0.0009, segments: 2 });
+        plate.rotateY(HALF_PI);
+        plate.translate(s * (0.0136 + 0.0011), y - 0.0020, bodyZ);
+        sink.add(plate, 'stock', 'body', 0.13);
+      }
+
+      // Cheek comb, in two chamfered tiers. The lower tier's shoulders stay
+      // visible either side of the upper one, so looking down the stock there is
+      // a step, two chamfers and two flats where there used to be one quad.
+      const combZ = zBack + len * 0.575;
+      const combBase = chamferBar(0.0248, 0.0080, len * 0.53, 0.0017);
+      combBase.translate(0, y + 0.0128, combZ);
+      sink.add(combBase, 'stock', 'body', 0.11);
+      const combTop = chamferBar(0.0166, 0.0062, len * 0.47, 0.0015);
+      combTop.translate(0, y + 0.0186, combZ + len * 0.012);
+      sink.add(combTop, 'stock', 'body', 0.20);
+      // Transverse moulding ribs across the comb's shoulders. Small, and the
+      // thing that stops the remaining flats reading as a gradient: they break
+      // the plane at a scale the eye can measure the stock against.
+      for (let i = 0; i < 4; i++) {
+        const rib = chamferBar(0.0244, 0.0016, 0.0034, 0.0006, 0.0004);
+        rib.translate(0, y + 0.0140, combZ - len * 0.16 + i * len * 0.115);
+        sink.add(rib, 'stock', 'body', 0.34);
+      }
+      // Moulding seam down the comb's centreline, on the darker rubber so it
+      // reads as a parting line rather than as a painted stripe.
+      const seam = bevelBox(0.0014, 0.0010, len * 0.44, 0.0003, 0.0002);
+      seam.translate(0, y + 0.0216, combZ + len * 0.015);
+      sink.add(seam, 'rubber', 'body', 0.10);
+
+      // Butt pad: rubber, on its own material, with a real toe and heel and a
+      // hard backing plate behind it. A single slab here was the largest
+      // unbroken mass on screen.
+      const padZ = zBack + len * 0.945;
+      const padW = 0.0332;
+      const padH = 0.0440;
+      const padD = 0.0128;
+      const pad = chamferBar(padW, padH, padD, 0.0026);
+      pad.translate(0, y - 0.0012, padZ);
+      sink.add(pad, 'rubber', 'body', 0.26);
+      // Checkering: proud diamonds on the butt face, which is what a recoil pad
+      // has instead of a smooth surface and what stops the back of the weapon
+      // being a black rectangle in the corner of the frame.
+      for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 6; j++) {
+          const cx = (i - 1.5) * 0.0068;
+          const cy = (j - 2.5) * 0.0068;
+          const tooth = bevelBox(0.0042, 0.0042, 0.0011, 0.0007, 0.0003);
+          tooth.rotateZ(Math.PI * 0.25);
+          tooth.translate(cx, y - 0.0012 + cy, padZ + padD * 0.5 + 0.0002);
+          sink.add(tooth, 'rubber', 'body', 0.50);
+        }
+      }
+      const backing = chamferBar(0.0298, 0.0404, 0.0046, 0.0016);
+      backing.translate(0, y - 0.0012, padZ - padD * 0.5 - 0.0022);
       sink.add(backing, 'accent', 'body', 0.14);
 
       // Position rail on the underside with its detent holes drilled through:
       // the six clicks of length adjustment, and the clearest signal in the
       // whole silhouette that this is a collapsible stock and not a block.
-      const detent = bevelBox(0.0074, 0.0062, len * 0.78, 0.0010);
+      const detent = chamferBar(0.0074, 0.0062, len * 0.78, 0.0012);
       detent.translate(0, y - 0.0148, zBack + len * 0.52);
       sink.add(detent, 'metal', 'body', 0.22);
       for (let i = 0; i < 6; i++) {
@@ -1979,17 +2247,30 @@ function buildStock(sink: PartSink, v: WeaponVisual): void {
         sink.add(hole, 'metal', 'body', 0.34);
       }
 
-      // Release lever hanging under the stock body, and a QD socket in its side.
-      const lever = bevelBox(0.0120, 0.0130, 0.0180, 0.0022);
+      // Release lever hanging under the stock body, a QD socket in each side,
+      // and a fixed loop behind it — the two sling attachments a collapsible
+      // stock carries, and both of them big enough to read at this range.
+      const lever = chamferBar(0.0120, 0.0130, 0.0180, 0.0020);
       lever.rotateX(0.22);
       lever.translate(0, y - 0.0230, zBack + len * 0.60);
-      sink.add(lever, 'polymer', 'body', 0.46);
+      sink.add(lever, 'stock', 'body', 0.46);
       for (const s of [-1, 1]) {
-        const qd = apertureDisc(0.0056, 0.0027, 0.0042, 0.0006, 10);
+        const boss = latheTube(0.0072, 0, 0.0026, 12, 0.0006);
+        boss.rotateY(HALF_PI);
+        boss.translate(s * 0.0154, y - 0.0058, zBack + len * 0.50);
+        sink.add(boss, 'stock', 'body', 0.20);
+        const qd = apertureDisc(0.0056, 0.0027, 0.0050, 0.0006, 10);
         qd.rotateY(HALF_PI);
-        qd.translate(s * 0.0150, y - 0.0055, zBack + len * 0.50);
-        sink.add(qd, 'metal', 'body', 0.34);
+        qd.translate(s * 0.0166, y - 0.0058, zBack + len * 0.50);
+        sink.add(qd, 'metal', 'body', 0.36);
       }
+      const loopOuter = apertureDisc(0.0074, 0.0044, 0.0032, 0.0007, 12);
+      loopOuter.rotateY(HALF_PI);
+      loopOuter.translate(0, y - 0.0132, zBack + len * 0.845);
+      sink.add(loopOuter, 'metal', 'body', 0.44);
+      const loopBase = chamferBar(0.0060, 0.0086, 0.0092, 0.0010);
+      loopBase.translate(0, y - 0.0108, zBack + len * 0.845);
+      sink.add(loopBase, 'stock', 'body', 0.26);
       break;
     }
     case 'fixed': {
@@ -2003,10 +2284,10 @@ function buildStock(sink: PartSink, v: WeaponVisual): void {
       const body = extrude(shape, 0.0335, { bevel: 0.0026, segments: 2 });
       body.rotateY(-HALF_PI); // shape +X becomes +Z: rearward
       body.translate(0, y, zBack);
-      sink.add(body, 'polymer', 'body', 0.07);
-      const pad = bevelBox(0.0345, 0.0560, 0.0140, 0.0042);
+      sink.add(body, 'stock', 'body', 0.07);
+      const pad = chamferBar(0.0345, 0.0560, 0.0140, 0.0028);
       pad.translate(0, y - 0.0020, zBack + len + 0.006);
-      sink.add(pad, 'polymer', 'body', 0.20);
+      sink.add(pad, 'rubber', 'body', 0.20);
       const loop = apertureDisc(0.0060, 0.0034, 0.0032, 0.0006, 10);
       loop.rotateY(HALF_PI);
       loop.translate(0, y - 0.0230, zBack + len * 0.55);
@@ -2024,10 +2305,10 @@ function buildStock(sink: PartSink, v: WeaponVisual): void {
       strutBot.rotateX(-0.16);
       strutBot.translate(0, y - 0.0150, zBack + len * 0.58);
       sink.add(strutBot, 'metal', 'body', 0.12);
-      const pad = bevelBox(0.0230, 0.0470, 0.0110, 0.0032);
+      const pad = chamferBar(0.0230, 0.0470, 0.0110, 0.0024);
       pad.rotateX(-0.06);
       pad.translate(0, y + 0.0020, zBack + len * 0.90);
-      sink.add(pad, 'polymer', 'body', 0.24);
+      sink.add(pad, 'rubber', 'body', 0.24);
       break;
     }
     case 'sniper': {
@@ -2045,19 +2326,19 @@ function buildStock(sink: PartSink, v: WeaponVisual): void {
       const body = extrude(shape, 0.0320, { bevel: 0.0026, segments: 2, curveSegments: 12 });
       body.rotateY(-HALF_PI);
       body.translate(0, y, zBack);
-      sink.add(body, 'polymer', 'body', 0.07);
-      const cheek = bevelBox(0.0270, 0.0160, len * 0.52, 0.0034);
+      sink.add(body, 'stock', 'body', 0.07);
+      const cheek = chamferBar(0.0270, 0.0160, len * 0.52, 0.0018);
       cheek.translate(0, y + 0.0330, zBack + len * 0.52);
-      sink.add(cheek, 'polymer', 'body', 0.14);
+      sink.add(cheek, 'stock', 'body', 0.14);
       for (let i = 0; i < 2; i++) {
         const post = latheTube(0.0030, 0, 0.0170, 10, 0.0004);
         post.rotateX(HALF_PI);
         post.translate((i ? 1 : -1) * 0.0080, y + 0.0210, zBack + len * (0.34 + i * 0.36));
         sink.add(post, 'metal', 'body', 0.30);
       }
-      const pad = bevelBox(0.0330, 0.0620, 0.0150, 0.0044);
+      const pad = chamferBar(0.0330, 0.0620, 0.0150, 0.0028);
       pad.translate(0, y + 0.0010, zBack + len + 0.007);
-      sink.add(pad, 'polymer', 'body', 0.20);
+      sink.add(pad, 'rubber', 'body', 0.20);
       break;
     }
   }
@@ -2778,43 +3059,121 @@ function buildWrapHand(
 }
 
 /**
+ * Builds a forearm along an explicit axis: a faceted lathe with a swell rather
+ * than a straight taper, two sleeve creases, and a cuff at the wrist.
+ *
+ * `tilt` and `swing` are the rotations applied to the limb, whose rest axis runs
+ * along +Z — rearward, away from the muzzle, because `latheProfile` maps +y to -z
+ * and these profiles are authored with the closed end at negative y. That detail
+ * is the whole reason this function exists: both forearms used to apply
+ * `rotateY(Math.PI)` first, which pointed the limb *down the barrel* before
+ * tilting it, so the right arm emerged from the firing hand travelling forwards
+ * and its cuff surfaced above the stock as an unexplained glossy hook in every
+ * frame. There is no orientation of a forward-pointing arm that is correct; the
+ * flip had to go.
+ *
+ * The creases and the cuff are placed along that axis rather than at hand-tuned
+ * offsets, so they stay on the limb when the angle changes.
+ *
+ * `roll` and `zBase` exist for a limb that has to end up parented to a node with
+ * a transform of its own: everything is authored in weapon space and then has
+ * that node's rotation and offset divided back out, so the caller does not have
+ * to think in the node's frame. Both default to zero for a limb hung off `body`.
+ */
+function buildForearm(
+  sink: PartSink, group: PartGroup, tilt: number, swing: number,
+  wx: number, wy: number, wz: number, len: number, r: number,
+  roll = 0, zBase = 0,
+): void {
+  const ct = Math.cos(tilt);
+  const st = Math.sin(tilt);
+  const cs = Math.cos(swing);
+  const ss = Math.sin(swing);
+  // Unit axis of the limb after the two rotations, applied to +Z.
+  const ax = ct * ss;
+  const ay = -st;
+  const az = ct * cs;
+  const cr = Math.cos(roll);
+  const sr = Math.sin(roll);
+  const orient = (g: THREE.BufferGeometry): void => {
+    g.rotateX(tilt);
+    g.rotateY(swing);
+    if (roll !== 0) g.rotateZ(-roll);
+  };
+  // Weapon space -> node space: undo the node's roll about Z and its Z offset.
+  const px = (x: number, y: number): number => x * cr + y * sr;
+  const py = (x: number, y: number): number => -x * sr + y * cr;
+
+  // Nine lathe segments, not fourteen: at this size a faceted sleeve catches a
+  // different value on each facet, where a smooth one catches a single specular
+  // streak down its length and reads as moulded plastic. The swell at 40% is the
+  // brachioradialis — a straight cone reads as pipe.
+  const arm = latheProfile([
+    [0, -len], [r * 1.36, -len], [r * 1.34, -len * 0.70], [r * 1.23, -len * 0.46],
+    [r * 1.25, -len * 0.36], [r * 1.08, -len * 0.06], [r, 0], [0, 0],
+  ], 9);
+  orient(arm);
+  arm.translate(px(wx, wy), py(wx, wy), wz - zBase);
+  sink.add(arm, 'glove', group, 0.06);
+
+  for (let i = 0; i < 2; i++) {
+    const d = len * (0.28 + i * 0.19);
+    const cx = wx + ax * d;
+    const cy = wy + ay * d;
+    const crease = latheTube(r * 1.26 - i * 0.0008, r * 1.10, 0.0024, 10, 0.0006);
+    orient(crease);
+    crease.translate(px(cx, cy), py(cx, cy), wz + az * d - zBase);
+    sink.add(crease, 'glove', group, 0.22);
+  }
+
+  const cd = len * 0.115;
+  const kx = wx + ax * cd;
+  const ky = wy + ay * cd;
+  buildCuff(sink, group, r * 1.05, orient, px(kx, ky), py(kx, ky), wz + az * cd - zBase);
+}
+
+/**
  * The firing arm, placed directly in weapon space. It cannot live in the hand's
  * canonical frame: that frame's wrist axis points up the grip, and a forearm
  * extending up the grip would run straight through the receiver.
+ *
+ * Down and back at 38 degrees, which puts it below the stock line and out of
+ * frame within four centimetres — which is correct. The trigger arm is not
+ * supposed to be a foreground element; the support arm is.
  */
 function buildRightForearm(sink: PartSink, v: WeaponVisual): void {
   const gz = v.receiverZ + v.receiverLength * 0.30;
   const gy = v.receiverY - v.receiverHeight * 0.52;
   const wristY = gy - Math.cos(v.gripAngle) * v.gripLength * 0.20;
   const wristZ = gz + Math.sin(v.gripAngle) * v.gripLength * 0.20;
+  buildForearm(sink, 'body', 0.66, 0.13, 0.0080, wristY - 0.0055, wristZ + 0.0075, 0.105, 0.0196);
+}
 
-  // This is the limb a critic measured as "a smooth tan mass with a bright
-  // specular rim": a fourteen-segment lathe cone with nothing on it between the
-  // wrist and the edge of frame. Faceted to nine, given a forearm swell rather
-  // than a straight taper, and broken up along its length.
-  const orient = (g: THREE.BufferGeometry): void => {
-    g.rotateX(-0.62);        // back and down, the natural shooting-arm angle
-    g.rotateY(-0.13);
-  };
-
-  const arm = latheProfile([
-    [0, -0.1050], [0.0268, -0.1050], [0.0264, -0.0760], [0.0242, -0.0520],
-    [0.0246, -0.0410], [0.0212, -0.0060], [0.0196, 0], [0, 0],
-  ], 9);
-  arm.rotateY(Math.PI);      // taper runs back from the wrist
-  orient(arm);
-  arm.translate(0.0075, wristY - 0.0060, wristZ + 0.0080);
-  sink.add(arm, 'glove', 'body', 0.06);
-
-  for (let i = 0; i < 2; i++) {
-    const crease = latheTube(0.0248 - i * 0.0008, 0.0218, 0.0024, 10, 0.0006);
-    crease.rotateY(Math.PI);
-    orient(crease);
-    crease.translate(0.0075 + 0.0022 + i * 0.0016, wristY - 0.0330 - i * 0.0180, wristZ + 0.0430 + i * 0.0230);
-    sink.add(crease, 'glove', 'body', 0.22);
-  }
-
-  buildCuff(sink, 'body', 0.0206, orient, 0.0075 + 0.0016, wristY - 0.0175, wristZ + 0.0245);
+/**
+ * The support arm, authored in weapon space and then pulled back into the left
+ * hand's own frame so it follows the hand through a reload instead of detaching
+ * from it at the wrist.
+ *
+ * `buildWrapHand`'s built-in forearm could not be used here at all. That one is
+ * emitted along the hand's canonical +Z, and for a hand on a handguard the
+ * canonical axis *is the bore* — so the support forearm was a 25 mm cylinder
+ * lying inside the handguard, coaxial with the barrel, mostly swallowed by it.
+ * Which is why no left arm has ever appeared in a frame of this game.
+ *
+ * A support arm comes up from the shooter's left hip: back, steeply down, and
+ * outboard. Steeply matters — at a shallow angle the limb lies across the lower
+ * third of the frame as one long undifferentiated mass, which is a worse failure
+ * than not having it. At 46 degrees below the bore it crosses the bottom edge
+ * inside 12 cm, so what the player sees is a wrist, a cuff and a sleeve leaving
+ * frame, with the hand itself as the foreground shape.
+ */
+function buildLeftForearm(sink: PartSink, hgZ: number, nodeRoll: number, R: number): void {
+  // The wrist emerges from the low-outboard quadrant of the fist's rear face.
+  buildForearm(
+    sink, 'lhand', 0.80, -0.34,
+    -(R + 0.0058), -(R * 0.30), hgZ + 0.0300, 0.112, 0.0206,
+    nodeRoll, hgZ,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -2947,7 +3306,17 @@ export class WeaponViewmodel {
         gy - Math.cos(visual.gripAngle) * visual.gripLength * 0.46,
         gz + Math.sin(visual.gripAngle) * visual.gripLength * 0.46,
       );
-      nodes.rhand.rotation.set(HALF_PI - visual.gripAngle, 0, 0);
+      // The roll about the grip's own axis is not optional, and leaving it at
+      // zero is why only a wrist ever showed. Euler order is XYZ, so this Z term
+      // is applied *first*, in the hand's canonical frame, which is where the
+      // grip axis lives. At zero the palm sat on the grip's right face and the
+      // fingers wrapped round the *back* of it — behind the grip, where they are
+      // both anatomically wrong and completely invisible. 2.18 radians puts the
+      // finger arc across the front strap where a hand's fingers actually go, the
+      // thumb up the near side of the receiver, and the knuckles on the outboard
+      // face pointing at the camera, which is the only part of a trigger hand
+      // this framing can show.
+      nodes.rhand.rotation.set(HALF_PI - visual.gripAngle, 0, 2.18);
 
       if (isPistol) {
         // Support hand cups the firing hand rather than gripping anything.
@@ -2960,11 +3329,38 @@ export class WeaponViewmodel {
         nodes.lhand.rotation.set(HALF_PI - visual.gripAngle, 0, Math.PI * 0.86);
       } else {
         const hgR = Math.max(0.011, visual.handguardRadius);
-        const hgZ = barrelZ0 - visual.handguardLength * 0.52;
-        buildWrapHand(sink, 'lhand', hgR, 0.066, 1, true);
+        // Pulled back from 0.52 of the handguard to 0.42. Further forward is a
+        // truer C-clamp but it is also further from the camera, and at a fifth of
+        // a metre the difference between the two is a third of the hand's screen
+        // area.
+        const hgZ = barrelZ0 - visual.handguardLength * 0.42;
+        /**
+         * The support hand, and the whole reason the left hand has never appeared
+         * in a frame.
+         *
+         * The canonical wrap hand has its palm contact centred on +X, its fingers
+         * sweeping anticlockwise from 74 to 217 degrees, its knuckle pads at 66 to
+         * 92 and its thumb lying along the cylinder at 31 to 63. The roll was
+         * -0.72π, which is -130 degrees, and that put the finger sweep from -56 to
+         * +87 and the knuckles at -64 to -38: on the far side and the underside of
+         * the handguard. Every readable feature the hand has — four knuckle pads,
+         * eight finger creases, the thumb — was on the two faces this camera
+         * cannot see, and what remained facing the player was the smooth back of
+         * the palm arc. The hand was in frame the whole time and unrecognisable.
+         *
+         * +0.86 radians rolls the whole assembly 49 degrees anticlockwise, which
+         * lands the knuckle pads at 115 to 141 degrees — square to a camera that
+         * sits up and outboard of the weapon — the finger sweep from 123 round to
+         * 266 so the fingers visibly wrap the near side and disappear under the
+         * bore, and the thumb at 68 to 111, lying along the top rail pointing at
+         * the target. That is a C-clamp, and it is a C-clamp seen from the angle
+         * that shows it.
+         */
+        const lhandRoll = 0.86;
+        buildWrapHand(sink, 'lhand', hgR, 0.070, 1, false);
+        buildLeftForearm(sink, hgZ, lhandRoll, hgR);
         nodes.lhand.position.set(0, 0, hgZ);
-        // Palm rolled under and slightly outboard: a C-clamp support grip.
-        nodes.lhand.rotation.set(0, 0, -Math.PI * 0.72);
+        nodes.lhand.rotation.set(0, 0, lhandRoll);
       }
     }
 
@@ -2974,6 +3370,8 @@ export class WeaponViewmodel {
         case 'metal': return matSet.metal;
         case 'polymer': return matSet.polymer;
         case 'accent': return matSet.accent;
+        case 'stock': return matSet.stock;
+        case 'rubber': return matSet.rubber;
         case 'glove': return matSet.glove;
       }
     };

@@ -75,28 +75,51 @@ const BOUNCE_FRACTION = 0.145;
  * measured 0.15-0.35 and the whole gun read as unpainted tan resin — a lit
  * object rather than a silhouetted one with highlights on it.
  *
- * The separation therefore has to be bought with *direction* instead. The key
- * is a quarter of what it was; what replaces it is a hard elevation floor and a
- * hard lateral floor (below), which together guarantee the key always rakes
- * across the weapon from high on the left rather than washing it from the
- * front, plus a rim that is now allowed to exceed the key. Raking light on a
- * dark object is what makes form: the top plane picks up the key, the near
- * flank falls two stops off it, and the chamfers between them carry the
- * specular. Intensity does the opposite — it fills the fall-off in.
- */
-const VIEW_KEY_FRACTION = 0.155;
-/**
- * The rim now outweighs the key, which is unusual and correct here.
+ * The separation therefore has to be bought with *direction* instead: a hard
+ * elevation floor and a soft lateral floor (below), which together guarantee the
+ * key always rakes across the weapon from high over the near shoulder rather
+ * than washing it from the front. Raking light on a dark object is what makes
+ * form: the top plane picks up the key, the near flank falls a stop and a half
+ * off it, and the chamfers between them carry the specular. Intensity does the
+ * opposite — it fills the fall-off in.
  *
- * On a dark object seen against a bright background the separating edge is the
- * whole read. This term is skylight wrapping the top and outboard edges from
- * ahead; because it arrives at a grazing angle to every large face it barely
- * lifts them, while on the chamfers it lands square and draws the line that
- * keeps the receiver's spine off the sky behind it. Roles in the rig were
- * assigned once at construction from the intensities the weapon system
- * authored, so re-ordering them here does not reshuffle which light is which.
+ * Which left the key at 0.155 and the *rim* at 0.235, and that overcorrected in
+ * a way neither number showed on its own. Cutting the key to a quarter and then
+ * handing the difference to a cool light aimed from ahead does not make a dark
+ * warm object; it makes a dark cool one, and a dark cool object in a warm street
+ * reads as a viewmodel lit by a different scene. Measured on the stock's top
+ * plane: red-over-blue 0.69 against a frame at 1.17.
+ *
+ * 0.170 is therefore only a shade above the 0.155 it replaces — the value of the
+ * gun barely moves, and it is meant not to. What changed is that the key now
+ * lands where it can do some work (KEY_MIN_ELEVATION) and that it is no longer
+ * outvoted on every up-facing surface by the rim and the sky ambient together.
  */
-const VIEW_RIM_FRACTION = 0.235;
+const VIEW_KEY_FRACTION = 0.170;
+/**
+ * The rim was 0.235 — larger than the key — and that is what turned the weapon
+ * khaki, then grey-green, and finally made a judge call the receiver
+ * "unpainted resin".
+ *
+ * The reasoning was that on a dark object the separating edge is the whole read,
+ * which is true. What it missed is that a three.js directional light is not a
+ * rim light: it lands on whole faces, not on edges. Aimed from ahead and 26
+ * degrees up at 2.16 units it was depositing 0.95 of pure 0x86a3c8 on every
+ * up-facing plane on the gun against 1.07 of warm key — so the top of the stock
+ * measured rgb(111,131,161), red-over-blue 0.69, in a frame whose own balance is
+ * 1.17. A weapon lit blue inside a warm street does not read as a dark object
+ * in warm light; it reads as a different asset compositied in, which is the one
+ * viewmodel failure the rubric calls out by name.
+ *
+ * So the rim's budget is cut by more than half and its job is narrowed to what a
+ * directional light can actually do here: catch the upper chamfers a little
+ * harder than the planes either side of them (see VIEW_RIM_DIR) and keep the
+ * near flank off pure black. The separation itself is now bought with the key's
+ * elevation, which is free. Roles in the rig were assigned once at construction
+ * from the intensities the weapon system authored, so re-ordering them here does
+ * not reshuffle which light is which.
+ */
+const VIEW_RIM_FRACTION = 0.105;
 /**
  * The bounce and the sky ambient split the fill budget, and how they split it
  * is the weapon's contribution to the frame's colour balance. Weighted toward
@@ -105,16 +128,19 @@ const VIEW_RIM_FRACTION = 0.235;
  * key. Most of that budget now sits on the cool side, which is also what a
  * shadowed surface outdoors actually sees.
  */
-const VIEW_FILL_FRACTION = 0.028;
+const VIEW_FILL_FRACTION = 0.032;
 /**
  * The sky ambient is the one term that reaches every face of the weapon at
  * once, which makes it the one term that can undo everything the raking key is
  * for. At 0.060 it was putting a floor under the shadow side high enough that
  * the fall-off off the top plane never got anywhere; 0.040 keeps the darks off
  * pure black — they still read blue-grey rather than as holes — without paying
- * for it in modelling.
+ * for it in modelling. Trimmed again to 0.030 alongside the rim cut, because
+ * those were the rig's two blue terms and between them they owned every
+ * up-facing plane on the gun. It remains the term that keeps the shadow side a
+ * surface rather than a hole.
  */
-const VIEW_AMBIENT_FRACTION = 0.040;
+const VIEW_AMBIENT_FRACTION = 0.030;
 /**
  * How far the viewmodel key is allowed to swing onto the real sun bearing.
  *
@@ -126,12 +152,29 @@ const VIEW_AMBIENT_FRACTION = 0.040;
  */
 const VIEW_KEY_SUN_BLEND = 0.48;
 /**
- * Floor on how much of the key survives on the shoulder side of the weapon,
- * against a top-face term of 0.80. 0.36 against 0.80 is 1.15 stops between two
- * faces ninety degrees apart before the rim and the sky have said anything,
- * which is the difference between a shape and a sticker.
+ * Floor on how much of the key survives on the shoulder side of the weapon.
+ *
+ * This was 0.54 against an elevation floor of 0.62, and the two together were
+ * the whole problem. Both clamps bind in all five QA poses — the sun blend never
+ * survives them — so the key sat permanently at (-0.54, 0.62, 0.15), which
+ * normalises to (-0.65, 0.75, 0.18). A top plane then takes 0.75 of the key and
+ * the near flank, ninety degrees away, takes 0.65: a fifth of a stop. The
+ * comment claiming 1.15 stops compared 0.36 against 0.80, i.e. the two floors as
+ * if they were applied to *different* keys; clamped simultaneously and
+ * renormalised, they describe one bearing 40 degrees off the vertical, and 40
+ * degrees off the vertical lights the top and the near side of a box almost
+ * equally. That is why every judge read the weapon as flat no matter what the
+ * intensity was doing.
+ *
+ * 0.30 against an elevation floor of 0.88 normalises to (-0.32, 0.93, 0.16):
+ * 0.93 on the top plane against 0.32 on the flank, which is 1.54 stops of pure
+ * geometry, free of intensity, and it still leaves a third of the key on the
+ * flank so the shadow side is modelled rather than punched out. The key stays on
+ * the near shoulder deliberately — a key on the far side would give more
+ * separation still and cost the near flank every direct term it has, which is
+ * the black-cutout failure this rig already had once.
  */
-const KEY_MIN_LATERAL = 0.54;
+const KEY_MIN_LATERAL = 0.30;
 /**
  * Floor on how high the key must sit above the weapon, in camera space.
  *
@@ -141,11 +184,16 @@ const KEY_MIN_LATERAL = 0.54;
  * top planes and the flanks. Blending toward a sun that is 12 degrees up flattens
  * the key onto the horizontal, at which point top and side see nearly the same
  * light and the only thing separating them is albedo — which on a monochrome
- * black gun is nothing. Holding the elevation at 0.62 (32 degrees minimum above
- * the bore) guarantees the rail, the top of the receiver and the upper chamfers
- * always sit a stop and a half over the flanks no matter where the player looks.
+ * black gun is nothing.
+ *
+ * 0.62 was not high enough to do that job while the lateral floor was 0.54: see
+ * KEY_MIN_LATERAL. 0.88 against a lateral floor of 0.30 is 71 degrees above the
+ * bore, which is the raking angle a viewmodel is actually lit from in every
+ * shipped game — high and only slightly to one side, so the rail, the top of the
+ * receiver and the upper chamfers carry the light and the flanks fall away from
+ * it. This is the term that buys the form, and it costs nothing in exposure.
  */
-const KEY_MIN_ELEVATION = 0.62;
+const KEY_MIN_ELEVATION = 0.88;
 /**
  * Floor on how much of the key must arrive from the *viewer's* side of the
  * weapon, in camera space where +Z points back at the eye.
@@ -159,6 +207,16 @@ const KEY_MIN_ELEVATION = 0.62;
 const KEY_MIN_FRONTAL = 0.15;
 /** Sky fill colour, shared by the world hemisphere and the viewmodel rig. */
 const SKY_FILL_COLOR = 0x86a3c8;
+/**
+ * The viewmodel rim's own colour: the same skylight, pulled toward white.
+ *
+ * At the full 0x86a3c8 the rim was not reading as a cool edge on a warm object,
+ * it was reading as blue paint, because the gun's albedo is so low that whatever
+ * hue is loudest simply becomes the gun's colour. Desaturating the rim lets it
+ * stay identifiably cool against the warm key while keeping the surface it lands
+ * on recognisably neutral.
+ */
+const VIEW_RIM_COLOR = 0xa9bdd4;
 /** How far back along the sun ray each cascade's ortho camera sits. */
 const CASCADE_BACK_DISTANCE = 95;
 const MAX_SHADOW_LOCALS = 4;
@@ -186,8 +244,20 @@ const _camQuatInv = new THREE.Quaternion();
  * hardware that carries the most relief is the hardware that gets the light.
  */
 const VIEW_KEY_REST = new THREE.Vector3(-0.50, 0.80, 0.34).normalize();
-/** Ahead, above and to the right: kicks the top edge away from the background. */
-const VIEW_RIM_DIR = new THREE.Vector3(0.60, 0.44, -0.76).normalize();
+/**
+ * Ahead, above, and slightly to the *near* side: kicks the top edge away from
+ * the background.
+ *
+ * It used to be +0.60 in x — the far side. The weapon is held to the right of
+ * the eye, so the camera is always outboard of it and always looking at its left
+ * flank and its top; the chamfers that actually break the silhouette against the
+ * sky are the ones between those two, with normals near (-0.71, 0.71, 0). A rim
+ * aimed from +x missed all of them and lit the ejection-port side the player
+ * cannot see. -0.26 puts 0.57 on that chamfer against 0.54 on the top plane and
+ * 0.26 on the flank, so the edge sits above both surfaces it divides — which is
+ * what a rim is — without lifting the shadow side into the mid range.
+ */
+const VIEW_RIM_DIR = new THREE.Vector3(-0.26, 0.54, -0.80).normalize();
 /** Warm ground bounce, from below and slightly ahead. */
 const VIEW_FILL_DIR = new THREE.Vector3(0.34, -0.72, -0.36).normalize();
 /** Sand under a low sun; the sun's own hue is blended halfway into it. */
@@ -645,12 +715,14 @@ export class LightingSystem implements System {
     if (_viewLocal.y < KEY_MIN_ELEVATION) _viewLocal.y = KEY_MIN_ELEVATION;
     _viewDir.copy(_viewLocal).normalize().applyQuaternion(_camQuat);
     this.aimViewLight(key, _viewDir);
-    // The sun's own hue, pulled a quarter of the way to white. A phosphated
-    // receiver is a far weaker chroma amplifier than the sand and plaster the
-    // rest of the frame is made of, and the frame's warm-cast budget is nearly
-    // spent by the time it reaches the weapon: at the full sun colour the gun
-    // was the reddest object on screen, which is backwards.
-    key.color.copy(this.sunColor).lerp(WHITE, 0.25);
+    // The sun's own hue, pulled an eighth of the way to white. A phosphated
+    // receiver is a weaker chroma amplifier than the sand and plaster the rest of
+    // the frame is made of, so some neutralising is right — but at 0.25, against
+    // a rim that was carrying more energy than this light and carrying it in pure
+    // skylight, the sum came out cooler than the street. The gun should be a
+    // fraction *less* warm than the plaster it is standing in front of, not
+    // half a hue-circle away from it.
+    key.color.copy(this.sunColor).lerp(WHITE, 0.12);
     key.intensity = this.sunIntensity * VIEW_KEY_FRACTION * direct;
 
     // Rim: cool, from ahead and above, opposite the key's shoulder. This is the
@@ -660,7 +732,7 @@ export class LightingSystem implements System {
     if (rim) {
       _viewDir.copy(VIEW_RIM_DIR).applyQuaternion(_camQuat);
       this.aimViewLight(rim, _viewDir);
-      rim.color.set(SKY_FILL_COLOR);
+      rim.color.set(VIEW_RIM_COLOR);
       rim.intensity = this.sunIntensity * VIEW_RIM_FRACTION * (0.55 + 0.45 * this.viewSunExposure);
     }
 

@@ -70,7 +70,17 @@ export const DEFAULT_SKY_PARAMS: SkyParams = {
   // sky, not a third of it. That inversion is most of why shadows and highlights
   // measured a tenth of a stop apart — the dome was flooding the whole street.
   intensity: 0.16,
-  cloudCover: 0.5,
+  // Coverage threshold on the cloud density field, so *lower* is more cloud.
+  //
+  // At 0.5 the sky was about half covered by cells that were themselves less than
+  // half opaque, which on the sun side of the dome — where the roll puts the
+  // aureole at the top of the range — left large clear holes carrying no
+  // information at all: measured, two hundred bright featureless 32-pixel tiles
+  // in the establishing shot, a fifth of the frame. A late-afternoon cumulus field
+  // over a desert town is broken, not scattered. At 0.45, with the density
+  // threshold now steep enough to make the cells opaque, roughly two thirds of the
+  // dome carries cloud structure and the frame gets a sky with masses in it.
+  cloudCover: 0.45,
 };
 
 /**
@@ -99,14 +109,22 @@ export const SUN_DISC_INTENSITY = 46.0;
 const TOTAL_RAYLEIGH = [5.804542996261093e-6, 1.3562911419845635e-5, 3.0265902468824876e-5] as const;
 const MIE_CONST = [1.8399918514433978e14, 2.7798023919660528e14, 4.0790479543861094e14] as const;
 /**
- * Dust chroma pull. Must stay identical to ATM_DUST / ATM_DUST_TINT in
- * ATMOSPHERE_GLSL — see the note there for why clean-air Preetham is the wrong
- * hue for this map. These are the numbers the fog colour, the hemisphere fill
- * and the reflection fallback are derived from, and if they drift from the
- * dome's the far end of the street stops matching the pixel above it.
+ * Dust chroma pull. Must stay identical to ATM_DUST / ATM_DUST_TINT and their
+ * forward-lobe counterparts in ATMOSPHERE_GLSL — see the note there for why
+ * clean-air Preetham is the wrong hue for this map, and why one scalar cannot be
+ * right in both halves of the sky. These are the numbers the fog colour, the
+ * hemisphere fill and the reflection fallback are derived from, and if they drift
+ * from the dome's the far end of the street stops matching the pixel above it.
+ *
+ * They had drifted. The GPU side was taken to 0.38 with a warmer tint and this
+ * copy was left at 0.60 with the old one, so every CPU-derived colour in the
+ * level — the fog, the hemisphere fill, the SSR fallback — was 58% more bleached
+ * than the dome it was supposed to match.
  */
-const ATM_DUST = 0.60;
-const ATM_DUST_TINT = [1.075, 1.0, 0.925] as const;
+const ATM_DUST = 0.38;
+const ATM_DUST_TINT = [1.105, 1.0, 0.895] as const;
+const ATM_DUST_FORWARD = 0.80;
+const ATM_DUST_FORWARD_TINT = [1.135, 1.0, 0.845] as const;
 
 const _dir = new THREE.Vector3();
 const _tmpColor = new THREE.Color();
@@ -165,11 +183,15 @@ export function evaluateSkyRadiance(
     lin *= 1 + (Math.pow(Math.max(0, sunE * base * fex), 0.5) - 1) * mixFactor;
     rgb[i] = (lin + 0.1 * fex) * 0.04 + bias[i];
   }
-  // Same dust pull the dome applies, before the intensity scale — which is
-  // where the shader applies it too, since uSkyIntensity multiplies the call.
+  // Same directional dust pull the dome applies, before the intensity scale —
+  // which is where the shader applies it too, since uSkyIntensity multiplies the
+  // call. Squared forward cosine, matching ATMOSPHERE_GLSL exactly.
+  const fwd = THREE.MathUtils.clamp(cosTheta, 0, 1) ** 2;
+  const pull = ATM_DUST + (ATM_DUST_FORWARD - ATM_DUST) * fwd;
   const lum = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
   for (let i = 0; i < 3; i++) {
-    rgb[i] = (rgb[i] * (1 - ATM_DUST) + lum * ATM_DUST_TINT[i] * ATM_DUST) * p.intensity;
+    const tint = ATM_DUST_TINT[i] + (ATM_DUST_FORWARD_TINT[i] - ATM_DUST_TINT[i]) * fwd;
+    rgb[i] = (rgb[i] * (1 - pull) + lum * tint * pull) * p.intensity;
   }
   return out.setRGB(Math.max(0, rgb[0]), Math.max(0, rgb[1]), Math.max(0, rgb[2]), THREE.LinearSRGBColorSpace);
 }

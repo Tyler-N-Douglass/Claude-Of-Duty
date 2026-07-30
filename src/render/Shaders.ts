@@ -135,9 +135,39 @@ const vec3 ATM_MIE_CONST = vec3( 1.8399918514433978e14, 2.7798023919660528e14, 4
  * one. Held to 0.38, with a slightly warmer floor to hold the balance it was
  * bought for, the zenith keeps a saturated deep blue and the frame keeps a
  * colour to grade against.
+ *
+ * The pull is *directional*, and that is the correction that matters most here.
+ * A single scalar cannot be right in both halves of the sky: Preetham's
+ * circumsolar radiance at a 21-degree sun comes out blue-dominant — measured
+ * (1.34, 1.79, 2.23) at 33 degrees from the disc, which is a hue no photograph
+ * of an aureole has ever recorded — while its anti-solar sky is close to
+ * correct. One number therefore has to choose between bleaching the good half
+ * and leaving the bad half blue, and 0.60 chose to bleach: the whole dome went
+ * achromatic and the aerial perspective, which fades into it, carried that
+ * bleach onto every distant surface in the frame. Split in two, the forward lobe
+ * is pulled hard toward the warm grey a dust aureole actually is, and the
+ * anti-solar sky keeps its full Rayleigh blue. Warm near the sun, cool away
+ * from it, out of one evaluation.
  */
 const float ATM_DUST = 0.38;
 const vec3 ATM_DUST_TINT = vec3( 1.105, 1.0, 0.895 );
+/** Pull and hue inside the forward-scattering lobe. */
+const float ATM_DUST_FORWARD = 0.80;
+const vec3 ATM_DUST_FORWARD_TINT = vec3( 1.135, 1.0, 0.845 );
+/**
+ * Fraction of its chroma the dome keeps where the roll compresses it hardest.
+ *
+ * The roll used to run per channel, and a per-channel hyperbolic that asymptotes
+ * to the same maximum in all three channels is a *bleach*: at 33 degrees from
+ * the sun a raw radiance of (1.34, 1.79, 2.23) came out as (0.1568, 0.1576,
+ * 0.1581) — three numbers identical to three decimal places, a measured
+ * saturation of 0.013, and a value range across the whole sun side of the sky of
+ * 1.36:1 where the radiance range was 17:1. That single line is why the sky read
+ * as paper, and because the aerial perspective fades into the same function it
+ * is also why the far block, the tower and the market all arrived at the sky's
+ * value with no colour of their own.
+ */
+const float ATM_ROLL_CHROMA_FLOOR = 0.62;
 
 float atmRayleighPhase( float c ) { return ( 3.0 / ( 16.0 * PST_PI ) ) * ( 1.0 + c * c ); }
 
@@ -185,33 +215,60 @@ vec3 atmosphereRadiance( vec3 dir, vec3 sunDir, float turbidity, float rayleigh,
   );
 
   vec3 col = ( Lin + 0.1 * Fex ) * 0.04 + vec3( 0.0, 0.00035, 0.00085 );
+
+  // Directional dust. The forward lobe is where Preetham's hue is wrong and
+  // where a real dust column is nearly achromatic and warm; the anti-solar half
+  // keeps its blue. Squared cosine rather than the Mie phase so the transition
+  // spans the whole sun side of the dome instead of a tight ring — dust is not
+  // a thin aureole, it is the air.
+  float fwd = sat( cosTheta );
+  fwd *= fwd;
+  float pull = mix( ATM_DUST, ATM_DUST_FORWARD, fwd );
+  vec3 tint = mix( ATM_DUST_TINT, ATM_DUST_FORWARD_TINT, fwd );
   // Inline luma: this block is included by callers that do not all pull in
   // POST_COMMON ahead of it.
-  return mix( col, vec3( dot( col, vec3( 0.2126, 0.7152, 0.0722 ) ) ) * ATM_DUST_TINT, ATM_DUST );
+  return mix( col, vec3( dot( col, vec3( 0.2126, 0.7152, 0.0722 ) ) ) * tint, pull );
 }
 
 /**
- * Hyperbolic roll for sky radiance.
+ * Hyperbolic roll for sky radiance, applied to LUMINANCE.
  *
  * The old code did min( sky, 4.0 ). A hard min on the Mie aureole is what
  * produced a 300-pixel plateau of *identical* cream pixels around the sun: not
- * a sun, a hole cut in the sky. This leaves everything under knee untouched
- * and asymptotes to maxV above it, so the aureole always has a gradient in
- * it and the only thing that can reach the top of the range is the disc.
+ * a sun, a hole cut in the sky. A hyperbolic leaves everything under the knee
+ * untouched and asymptotes to maxV above it, so the aureole always has a
+ * gradient in it and the only thing that can reach the top of the range is the
+ * disc.
+ *
+ * Running it per channel, though, throws the colour away with the range — see
+ * ATM_ROLL_CHROMA_FLOOR. Three channels compressed independently toward one
+ * asymptote converge on each other, so the harder the roll works the whiter the
+ * result, and the sun side of the dome ended up a single achromatic value. The
+ * compression belongs on the luminance, which is the quantity that is actually
+ * over budget: the chroma is carried through it and only allowed to relax toward
+ * neutral as the lobe deepens, because a genuine dust aureole does whiten — just
+ * not to zero, and not four degrees off the disc.
  */
 vec3 skyRoll( vec3 x, float knee, float maxV ) {
+  vec3 c = max( vec3( 0.0 ), x );
+  float L = dot( c, vec3( 0.2126, 0.7152, 0.0722 ) );
+  if ( L <= knee ) return c;
   float range = max( 1e-3, maxV - knee );
-  vec3 over = max( vec3( 0.0 ), x - knee );
-  vec3 rolled = knee + range * ( over / ( over + range ) );
-  return mix( x, rolled, step( vec3( knee ), x ) );
+  float over = L - knee;
+  float rolled = knee + range * ( over / ( over + range ) );
+  // Chroma as an offset from grey, so the reconstruction cannot shift luminance.
+  vec3 chroma = c * ( rolled / max( L, 1e-6 ) ) - vec3( rolled );
+  float keep = mix( 1.0, ATM_ROLL_CHROMA_FLOOR, sat( over / ( over + range * 2.0 ) ) );
+  return vec3( rolled ) + chroma * keep;
 }
 
 /**
- * The dome as the frame sees it, minus clouds: atmosphere, ground hemisphere,
- * horizon haze band, rolled. This is the function the aerial perspective fades
- * into, so by construction it cannot disagree with the background.
+ * The dome before the roll: atmosphere, ground hemisphere, horizon haze band.
+ *
+ * Split out because the cloud layers need to know how hard the roll is about to
+ * work on the sky beside them — see the cloud composite in SKY_FRAG.
  */
-vec3 skyDomeRadianceH(
+vec3 skyDomePreRoll(
   vec3 dir, vec3 sunDir, float turbidity, float rayleigh, float mieCoefficient, float mieG,
   float intensity, vec3 groundColor, float rollKnee, float rollMax, out vec3 horizonCol
 ) {
@@ -226,11 +283,33 @@ vec3 skyDomeRadianceH(
 
   // Real air never lets the horizon meet the ground clean. Rolled first so the
   // band cannot smear the aureole across the bottom third of a backlit sky.
+  //
+  // Backed off from half strength: this band is a *neutral cream* mixed over the
+  // lowest few degrees, and the lowest few degrees are exactly where the far end
+  // of a street canyon sits. At 0.5, with the warm multiplier on top, it was
+  // taking chroma out of the one region the aerial perspective fades into. The
+  // horizon still does not meet the ground clean; it just does it with a colour.
   float hazeBand = exp( -abs( dir.y ) * 9.0 );
   vec3 haze = skyRoll( horizonCol, rollKnee, rollMax ) * 1.04 + vec3( 0.012, 0.013, 0.015 ) * intensity;
-  sky = mix( sky, mix( sky, haze, 0.5 ) * vec3( 1.04, 1.01, 0.975 ), hazeBand * 0.5 );
+  sky = mix( sky, mix( sky, haze, 0.5 ) * vec3( 1.025, 1.005, 0.985 ), hazeBand * 0.34 );
 
-  return skyRoll( max( vec3( 0.0 ), sky ), rollKnee, rollMax );
+  return max( vec3( 0.0 ), sky );
+}
+
+/**
+ * The dome as the frame sees it, minus clouds: atmosphere, ground hemisphere,
+ * horizon haze band, rolled. This is the function the aerial perspective fades
+ * into, so by construction it cannot disagree with the background.
+ */
+vec3 skyDomeRadianceH(
+  vec3 dir, vec3 sunDir, float turbidity, float rayleigh, float mieCoefficient, float mieG,
+  float intensity, vec3 groundColor, float rollKnee, float rollMax, out vec3 horizonCol
+) {
+  vec3 sky = skyDomePreRoll(
+    dir, sunDir, turbidity, rayleigh, mieCoefficient, mieG, intensity, groundColor,
+    rollKnee, rollMax, horizonCol
+  );
+  return skyRoll( sky, rollKnee, rollMax );
 }
 
 vec3 skyDomeRadiance(
@@ -732,6 +811,10 @@ uniform float uMaxDistance;
 uniform float uFrame;
 uniform float uScatterKnee;
 uniform float uScatterMax;
+/** Share of the open-air in-scatter this pass keeps; see the note in main(). */
+uniform float uShaftGain;
+/** Share kept where the air is fully shadowed. The shaft is the ratio of these. */
+uniform float uShaftAmbient;
 
 #if CSM_COUNT > 0
 uniform highp sampler2DShadow uShadow0;
@@ -793,7 +876,8 @@ void main() {
   // Blue-noise-ish dither so the 12 steps read as haze, not as bands.
   float dither = ignNoise( gl_FragCoord.xy + uFrame * 3.7 );
 
-  vec3 scatter = vec3( 0.0 );
+  float scatter = 0.0;
+  float scatterOpen = 0.0;
   float transmittance = 1.0;
 
   for ( int i = 0; i < VOL_STEPS; i ++ ) {
@@ -805,13 +889,37 @@ void main() {
     float sigma = uDensity * h;
     if ( sigma < 1e-6 ) continue;
 
-    float vis = sunVisibility( w, t );
-    scatter += transmittance * vis * sigma * stepLen * phase;
+    float weight = transmittance * sigma * stepLen * phase;
+    scatterOpen += weight;
+    scatter += weight * sunVisibility( w, t );
     transmittance *= exp( -sigma * stepLen * 1.35 );
     if ( transmittance < 0.01 ) break;
   }
 
-  vec3 lit = scatter * uSunColor;
+  // What this pass is allowed to contribute, and it is much less than the march
+  // computes — because the march is computing something the frame already has.
+  //
+  // The composite's aerial perspective blends every world pixel toward the sky
+  // radiance along its own view ray, and that radiance *is* the in-scatter of
+  // unshadowed air: Preetham integrates the same forward lobe out to the top of
+  // the atmosphere. Adding an unconditional 64-metre dust column on top counts
+  // the same photons a second time, and because the double count is a smooth
+  // function of depth alone it does not arrive as air — it arrives as a
+  // featureless pedestal that grows with distance. Measured on the hero frame it
+  // was 0.056 of scene radiance over the whole distant third, against a window
+  // reveal whose own radiance is 0.008: a 4:1 reveal delivered as 1.2:1, a
+  // sunlit road that reads sd 0.019 near the camera reading 0.009 at sixty
+  // metres, and the far block, the tower and the market all landing within a
+  // hundredth of the sky's value. That is the pale cutout, and this is its cause.
+  //
+  // What the analytic model genuinely cannot know is where the air is in
+  // *shadow*. So that is what survives: the open-air baseline is kept only at
+  // uShaftAmbient, and the ratio between lit and shadowed air — which is the
+  // shaft, and the only part of this pass anybody can see as a shape — is kept
+  // at full strength. A rooftop gap still throws a visible wedge across the
+  // street; a hundred metres of empty air no longer throws a sheet over the town.
+  float shadowed = 1.0 - scatter / max( scatterOpen, 1e-7 );
+  vec3 lit = uSunColor * scatterOpen * mix( uShaftGain, uShaftAmbient, shadowed );
 
   // Roll the in-scatter, and this is the single largest fix in the frame.
   //
@@ -909,6 +1017,10 @@ void main() {
   // Height-based aerial perspective. Distant geometry is not tinted with a
   // single fog colour but with the sky radiance along the view ray, which is
   // what makes a horizon read as air rather than as a grey wash.
+  //
+  // Published out of the block because the volumetric add below has to know it:
+  // the two passes are modelling the same air and must not both bill for it.
+  float aerOut = 0.0;
   if ( !isSky ) {
     vec3 P = viewFromDepth( vUv, d, uInvProj );
     vec3 worldP = ( uCamWorld * vec4( P, 1.0 ) ).xyz;
@@ -958,7 +1070,8 @@ void main() {
     float lHere = lumaOf( color );
     float lWide = lumaOf( wide );
     float recess = sat( ( lWide - lHere ) / max( 1e-3, lWide + lHere ) );
-    aer *= 1.0 - 0.55 * recess * recess;
+    aer *= 1.0 - 0.72 * recess * recess;
+    aerOut = aer;
 
     // Below a percent of haze the analytic sky evaluation cannot change the
     // pixel by a code value, and most of a street frame is inside that. Worth
@@ -1019,13 +1132,16 @@ void main() {
   }
 
   if ( uVolumeEnabled > 0.5 ) {
-    // Halved again over the sky. The dome is a Preetham evaluation: it already
-    // integrates this exact forward scattering out to the top of the atmosphere,
-    // so adding a 64-metre dust column on top of it counts the aureole twice —
-    // and the sky is the one surface with no depth of its own to justify the
-    // extra path length. Not zeroed, because a shaft that stopped dead at a
-    // roofline would read as a cut-out rather than as air.
-    color += texture2D( tVolume, vUv ).rgb * ( isSky ? 0.5 : 1.0 );
+    // Quartered over the sky, and taken down by the haze fraction over the world.
+    // The dome is a Preetham evaluation: it already integrates this exact forward
+    // scattering out to the top of the atmosphere, so adding a 64-metre dust
+    // column on top of it counts the aureole twice — and the sky is the one
+    // surface with no depth of its own to justify the extra path length. The same
+    // double count applies to every world pixel in proportion to how much of it
+    // the aerial perspective has already replaced with sky radiance, which is
+    // what aerOut is. Not zeroed, because a shaft that stopped dead at a roofline
+    // would read as a cut-out rather than as air.
+    color += texture2D( tVolume, vUv ).rgb * ( isSky ? 0.25 : 1.0 - 0.6 * aerOut );
   }
 
   // Alpha 0 marks "world"; the viewmodel pass overwrites it with 1.
@@ -1578,6 +1694,10 @@ uniform float uDistortion;
 uniform float uVignette;
 uniform float uGrain;
 uniform float uSharpen;
+/** Wide-radius local contrast. See the note at its use. */
+uniform float uClarity;
+uniform float uClarityRadius;
+uniform float uClarityLimit;
 uniform float uFxaa;
 uniform float uFilmBlack;
 uniform vec3 uFilmBlackTint;
@@ -1678,6 +1798,43 @@ void main() {
       texture2D( tDiffuse, uvD - vec2( 0.0, texel.y ) ).rgb;
     blur *= 0.25;
     color = clamp( color + ( color - blur ) * uSharpen, 0.0, 1.0 );
+  }
+
+  // Local contrast, at a radius the eye reads as form rather than as edge.
+  //
+  // Distinct from the one-pixel unsharp above, which only touches the very top
+  // of the frequency band and does nothing for a surface whose structure lives
+  // at ten or twenty pixels. Measured on the flat regions this frame was failing
+  // on, the residual after an eight-pixel blur carries as much energy as the
+  // whole tile's variance — the information is present in the buffer and the
+  // display curve is simply not giving it any slope. This gives it some back.
+  //
+  // Two constraints make it safe. The gain rolls off hyperbolically with the size
+  // of the deviation, so a facade against the sky cannot ring — a large step gets
+  // almost none of it while a subtle one gets all of it. And it is asymmetric:
+  // the dark side of a deviation gets the full gain and the light side rather
+  // less, because the failure being fixed is content sitting too high on the
+  // curve, and adding halo to the bright side of it would only put more of the
+  // frame above the clipping threshold.
+  if ( uClarity > 0.0 ) {
+    // At output texel spacing, not the internal buffer's: the preset the review
+    // is captured at renders below the canvas resolution, and a radius specified
+    // in source texels would shrink with it.
+    vec2 o = max( uAaTexel, texel ) * uClarityRadius;
+    vec3 lo = (
+      texture2D( tDiffuse, uvD + vec2( o.x, 0.0 ) ).rgb +
+      texture2D( tDiffuse, uvD - vec2( o.x, 0.0 ) ).rgb +
+      texture2D( tDiffuse, uvD + vec2( 0.0, o.y ) ).rgb +
+      texture2D( tDiffuse, uvD - vec2( 0.0, o.y ) ).rgb +
+      texture2D( tDiffuse, uvD + o * 0.72 ).rgb +
+      texture2D( tDiffuse, uvD - o * 0.72 ).rgb +
+      texture2D( tDiffuse, uvD + vec2( o.x, -o.y ) * 0.72 ).rgb +
+      texture2D( tDiffuse, uvD - vec2( o.x, -o.y ) * 0.72 ).rgb
+    ) * 0.125;
+    vec3 hi = color - lo;
+    vec3 gain = vec3( uClarity ) / ( 1.0 + abs( hi ) * ( uClarity / max( uClarityLimit, 1e-4 ) ) );
+    gain *= mix( vec3( 1.0 ), vec3( 0.6 ), step( vec3( 0.0 ), hi ) );
+    color = clamp( color + hi * gain, 0.0, 1.0 );
   }
 
   float vig = 1.0 - uVignette * smoothstep( 0.12, 0.78, r2 );
@@ -1792,7 +1949,7 @@ vec3 sunDiscRadiance( vec3 dir, vec3 sunDir ) {
  * cloud and a wisp of grey paint.
  */
 vec4 cloudLayer( vec3 dir, float height, float scale, vec2 drift, float cover, float sharpness ) {
-  if ( dir.y <= 0.012 ) return vec4( 0.0 );
+  if ( dir.y <= 0.007 ) return vec4( 0.0 );
   float t = height / dir.y;
   if ( t > 90000.0 ) return vec4( 0.0 );
 
@@ -1804,6 +1961,19 @@ vec4 cloudLayer( vec3 dir, float height, float scale, vec2 drift, float cover, f
 
   float density = sat( ( d - cover ) * sharpness );
   if ( density <= 0.001 ) return vec4( 0.0 );
+
+  // Vertical development, as a third octave at three times the frequency.
+  //
+  // A cumulus is not a smooth blob with a gradient across it; it is a stack of
+  // cells, and what tells you that is the way its sunward face breaks into
+  // shoulders and hollows at a much finer scale than the cell itself. Two
+  // octaves of fBm give the layer its outline and nothing inside it, which is
+  // why the clouds measured as a single-value band even where they were
+  // clearly visible. This modulates both the density and the light reaching
+  // the point, so a tower is thicker *and* brighter on the sun side than the
+  // hollow next to it.
+  float tower = fbm3( p * 3.1 + vec2( -6.2, 2.4 ) );
+  density *= 0.80 + 0.40 * tower;
 
   // Three taps along the sun's projection into the layer's plane, weighted so
   // the near ones dominate. fbm3 rather than fbm5 — self-shadowing needs the
@@ -1818,43 +1988,92 @@ vec4 cloudLayer( vec3 dir, float height, float scale, vec2 drift, float cover, f
   // Beer's law through the accumulated depth, plus a self-occlusion term from
   // the point's own density so the middle of a thick cell is darker than its
   // shoulder even when nothing upwind of it is.
-  float lightThrough = exp( -( od * 1.5 + density * 0.9 ) );
+  float lightThrough = exp( -( od * 1.5 + density * 0.9 ) ) * ( 0.82 + 0.36 * tower );
+
+  // Which face of the cell the ray is looking at, keyed to the sun vector.
+  //
+  // The layer is a plane, so the sun march above can only describe transmission
+  // *across* it — it has no idea that a camera at street level looking twenty
+  // degrees up is looking at the underside of a cumulus, and an underside lit by
+  // a 21-degree sun is in shadow. That omission is why the establishing shot had
+  // no dark mass anywhere in its sky: the visible band, three degrees to about
+  // forty, is exactly the band that should be presenting shaded bases, and every
+  // cell in it was being shaded as though seen from the side. Above the sun's own
+  // elevation the ray starts to see the sunlit top instead.
+  //
+  // The ramp is deliberately slow. A cumulus base sits a kilometre up and its own
+  // top only a kilometre above that, so from the ground the base is what is
+  // presented across almost the whole dome; what varies is how much sunlit flank
+  // comes with it. Returned rather than applied, because it does not belong on
+  // the transmission — it belongs on how bright the cell's *brightest* face is
+  // allowed to be, which is the caller's decision.
+  float faceUp = sat( ( dir.y - uSunDir.y * 0.92 ) * 1.1 );
 
   // Thin edges: where the cell has only just crossed the coverage threshold,
   // light passes almost straight through. This is the term that becomes the
   // silver lining when the sun is behind that edge.
   float thin = ( 1.0 - density ) * smoothstep( 0.0, 0.28, density );
 
-  float horizonFade = smoothstep( 0.012, 0.14, dir.y );
-  float distFade = 1.0 - sat( ( t * scale - 26.0 ) / 60.0 );
+  // Cumulus reach the horizon. Fading them out eight degrees up left the one
+  // band of sky a street-level camera actually frames — the establishing shot
+  // sees from three degrees to about forty-five — as bare Preetham gradient with
+  // nothing in it at all, which is both the "skybox reads as a gradient" hard
+  // fail and, measured, two hundred bright featureless tiles in the hero frame.
+  // Foreshortening does the work instead: distFade already thins the layer as the
+  // ray flattens, so what arrives near the horizon is a compressed, low-contrast
+  // band of cell structure rather than cumulus painted at full strength.
+  float horizonFade = smoothstep( 0.008, 0.038, dir.y );
+  float distFade = 1.0 - sat( ( t * scale - 26.0 ) / 90.0 );
 
-  return vec4( lightThrough, density * horizonFade * mix( 0.35, 1.0, distFade ), thin, 0.0 );
+  return vec4( lightThrough, density * horizonFade * mix( 0.55, 1.0, distFade ), thin, faceUp );
 }
 
 void main() {
   vec3 dir = normalize( vWorldDir );
 
-  // Atmosphere, ground hemisphere, horizon band and roll — the exact call the
-  // composite's aerial perspective and the SSR fallback make.
+  // Atmosphere, ground hemisphere, horizon band — the exact evaluation the
+  // composite's aerial perspective and the SSR fallback make, taken before the
+  // roll because the clouds have to be composited in the same space the roll
+  // leaves the sky in. See the ratio blend below.
   vec3 horizonCol;
-  vec3 sky = skyDomeRadianceH(
+  vec3 preRoll = skyDomePreRoll(
     dir, uSunDir, uTurbidity, uRayleigh, uMieCoefficient, uMieG,
     uSkyIntensity, uGroundColor, uSkyRollKnee, uSkyRollMax, horizonCol
   );
+  vec3 sky = skyRoll( preRoll, uSkyRollKnee, uSkyRollMax );
 
-  if ( dir.y > 0.012 ) {
+  if ( dir.y > 0.007 ) {
     float cosSun = dot( dir, uSunDir );
     float sunAmt = sat( cosSun * 0.5 + 0.5 );
 
-    vec4 low = cloudLayer( dir, 1.0, 1.35, vec2( 0.0042, 0.0017 ), uCloudCover, 3.4 );
-    vec4 high = cloudLayer( dir, 2.6, 0.62, vec2( 0.0115, -0.0038 ), uCloudCover + 0.12, 2.2 );
+    // Sharpness doubled, and it is the difference between cumulus and haze.
+    //
+    // At 3.4 against a coverage threshold of 0.5 the density field topped out
+    // around 0.44 — every cell in the sky was less than half opaque, so what the
+    // frame got was a wisp that shifted the sky by a few code values and could not
+    // possibly carry a shadow side. Measured on the hero pose the whole cloud
+    // field moved the sky's tile variance by 0.001. A fair-weather cumulus is
+    // optically thick in its middle and thin only at its edge, which is what a
+    // steep threshold gives: opaque cells with defined outlines, and the same
+    // steepness applied to the sun march below so their self-shadowing sharpens
+    // with them.
+    vec4 low = cloudLayer( dir, 1.0, 1.35, vec2( 0.0042, 0.0017 ), uCloudCover, 7.0 );
+    vec4 high = cloudLayer( dir, 2.6, 0.62, vec2( 0.0115, -0.0038 ), uCloudCover + 0.07, 4.2 );
 
     // Shadowed cloud is not grey: its underside is lit by the sky above it and
     // by the ground below, so it goes blue-grey with a warm floor. The sunward
     // shoulder takes the sun's own colour, warm and well over unity so it can
     // clip into the bloom the way a real cloud edge does at this hour.
-    vec3 shadeLow = vec3( 0.20, 0.23, 0.31 ) * uSkyIntensity + horizonCol * 0.25;
-    vec3 shadeHigh = vec3( 0.34, 0.37, 0.45 ) * uSkyIntensity + horizonCol * 0.18;
+    //
+    // The sky-fill term is taken through the roll. Unrolled, horizonCol on the
+    // sun side of the dome runs above unity — it is the same Preetham aureole,
+    // sampled along the longest slant path there is — so a quarter of it made a
+    // cloud's *shadow* side twice as bright as the sky it hung in, and the whole
+    // cloud field collapsed into a value indistinguishable from the aureole. The
+    // fill a cloud base receives cannot exceed the dome the frame is drawing.
+    vec3 skyFill = skyRoll( horizonCol, uSkyRollKnee, uSkyRollMax );
+    vec3 shadeLow = vec3( 0.20, 0.23, 0.31 ) * uSkyIntensity + skyFill * 0.25;
+    vec3 shadeHigh = vec3( 0.34, 0.37, 0.45 ) * uSkyIntensity + skyFill * 0.18;
     vec3 litLow = mix( shadeLow, vec3( 1.55, 1.36, 1.10 ) * uSkyIntensity, low.x );
     vec3 litHigh = mix( shadeHigh, vec3( 1.32, 1.22, 1.08 ) * uSkyIntensity, high.x );
 
@@ -1869,16 +2088,45 @@ void main() {
     litLow *= mix( 0.88, 1.22, sunAmt );
     litHigh *= mix( 0.92, 1.16, sunAmt );
 
+    // The cloud's radiance is absolute — a cumulus lit by this sun is the same
+    // brightness wherever in the sky it sits — and against an unrolled blue sky
+    // that is exactly right. But the roll is a *display* compression, and where
+    // it is working hard it flattens the cloud onto the sky along with
+    // everything else: at 33 degrees from the disc the aureole and a sunlit
+    // cloud top both asymptote to the roll maximum, which is why the sun side of
+    // the dome came out as one value with no cumulus in it at all. So where the
+    // sky has been rolled, the cloud is expressed instead as a *ratio* of the
+    // rolled sky beside it — a mass that is darker than the air on its shadow
+    // side and brighter on its lit side, which is what the physics said before
+    // the compression ate it. Below the knee the ratio form is never used.
+    float rolledAmt = sat( ( lumaOf( preRoll ) - uSkyRollKnee ) / max( 1e-4, uSkyRollKnee * 1.6 ) );
+    // Neutralised toward the sky's own luminance: a cloud takes its hue from the
+    // light on it, not from the Rayleigh scattering behind it.
+    vec3 body = mix( sky, vec3( lumaOf( sky ) ), 0.72 );
+    vec3 shadeMul = vec3( 0.83, 0.90, 1.14 );
+    vec3 litMul = vec3( 1.10, 1.02, 0.93 );
+
+    vec3 ratioLow = body * mix( 0.40 * shadeMul, mix( 0.68, 1.50, low.w ) * litMul, sat( low.x ) );
+    vec3 ratioHigh = body * mix( 0.56 * shadeMul, mix( 0.76, 1.30, high.w ) * litMul, sat( high.x ) );
+    ratioLow += silver * low.z * 1.9;
+    ratioHigh += silver * high.z * 1.3;
+
+    vec3 cLow = mix( litLow * 0.9, ratioLow, rolledAmt );
+    vec3 cHigh = mix( litHigh * 0.85, ratioHigh, rolledAmt );
+
     float aHigh = high.y * 0.55;
     float aLow = low.y * 0.94;
 
-    sky = mix( sky, litHigh * 0.85, sat( aHigh ) );
-    sky = mix( sky, litLow * 0.9, sat( aLow ) );
+    sky = mix( sky, cHigh, sat( aHigh ) );
+    sky = mix( sky, cLow, sat( aLow ) );
 
     // Cloud tops are the one part of the sky allowed above the roll, so a lit
-    // shoulder can still clip into the bloom the way a real one does. The disc
-    // is occluded by whatever cloud is in front of it.
-    sky = skyRoll( sky, uSkyRollKnee, uSkyRollMax * 1.35 );
+    // shoulder can still clip into the bloom the way a real one does. The limiter
+    // therefore starts at the sky's own ceiling rather than at the knee: rolling
+    // from the knee again would pull the tops straight back down onto the value
+    // the sky is already sitting at, which is the flattening this whole block
+    // exists to undo. The disc is occluded by whatever cloud is in front of it.
+    sky = skyRoll( sky, uSkyRollMax, uSkyRollMax * 1.9 );
     sky += sunDiscRadiance( dir, uSunDir ) * ( 1.0 - sat( aLow ) ) * ( 1.0 - sat( aHigh ) * 0.75 );
   } else {
     sky += sunDiscRadiance( dir, uSunDir );
