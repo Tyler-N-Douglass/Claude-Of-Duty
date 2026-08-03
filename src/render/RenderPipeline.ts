@@ -639,7 +639,17 @@ export class RenderPipeline implements RenderSystem {
       // 0.2 could not do that from any exposure — it compressed a five-stop
       // scene into a 1.6-stop grey band.
       uContrast: { value: 1.34 },
-      uToe: { value: 0.64 },
+      // Toe strength, which is one minus the slope the bottom of the curve keeps.
+      //
+      // At 0.64 the last stop and a half of the frame arrived at just over a
+      // third of its slope, and once the clarity high-pass and the grain had both
+      // subtracted from it, three percent of every frame was sitting at absolute
+      // zero: pure-black grout lines, a black rim around every crate and hard
+      // offset shadows with no penumbra in them. 0.54 keeps a slope of just under
+      // a half. The blacks are still black — p1 lands near sRGB 0.015, which is
+      // code four — they simply have steps in them now, which is the difference
+      // between shade and ink.
+      uToe: { value: 0.54 },
       uToeKnee: { value: 0.078 },
       // The shoulder was a knee, and it was in the wrong place.
       //
@@ -683,8 +693,13 @@ export class RenderPipeline implements RenderSystem {
       uClarityRadius: { value: 5.5 },
       uClarityLimit: { value: 0.045 },
       uFxaa: { value: 0 },
-      // sRGB code 3 of 255, cool-tinted. A print black, not a lifted shadow.
-      uFilmBlack: { value: 0.012 },
+      // sRGB code ~4 of 255, cool-tinted. A print black, not a lifted shadow.
+      //
+      // Raised a code value, and moved after the grain in FINAL_FRAG — see the
+      // note there. The metric that matters is the count of pixels at absolute
+      // zero, and it is a cliff: at code 3 the ordered dither alone can round a
+      // floor pixel down to 2, at code 4 nothing can.
+      uFilmBlack: { value: 0.0155 },
       uFilmBlackTint: { value: new THREE.Vector3(0.86, 0.92, 1.06) },
     });
 
@@ -803,7 +818,22 @@ export class RenderPipeline implements RenderSystem {
 
     const q = this.ctx?.quality;
     const dpr = this.renderer.getPixelRatio();
-    const scale = Math.max(0.4, (q?.renderScale ?? 1) * this.adaptiveScale);
+    // With TAA off, the internal buffer starts at 1:1 with the output.
+    //
+    // No edge filter can anti-alias a feature the rasteriser never sampled, and
+    // that is what the power cables are: 42mm of steel at twenty to forty-five
+    // metres is between 0.5 and 1.2 of an output pixel, and at the low preset's
+    // 0.7 internal scale it is between 0.35 and 0.85. Below one sample per pixel
+    // a catenary is not aliased, it is *intermittent* — it lands in some pixel
+    // centres and misses others, which is why it reads as a dashed line and why
+    // no amount of FXAA fixed it. A 0.7 buffer also means every silhouette in the
+    // frame reaches the viewer through a 1.43x bilinear upscale, so a one-pixel
+    // step becomes a one-and-a-half-pixel staircase before the filter ever sees
+    // it. TAA solves both by jittering the sample grid and accumulating; the low
+    // preset has no TAA, so it has to pay for its samples up front. The adaptive
+    // controller still scales down from here the moment the frame rate asks it to.
+    const base = q && !q.taa ? Math.max(1, q.renderScale) : (q?.renderScale ?? 1);
+    const scale = Math.max(0.4, base * this.adaptiveScale);
     const w = Math.max(2, Math.floor(this.cssWidth * dpr * scale));
     const h = Math.max(2, Math.floor(this.cssHeight * dpr * scale));
     this.bufferWidth = w;

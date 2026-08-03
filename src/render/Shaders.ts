@@ -1583,6 +1583,17 @@ vec3 acesFitted( vec3 c ) {
  *    curve that shapes the whole image is not a toe, it is a gamma, and the
  *    result was a midtone crush that flattened exactly the range the eye reads
  *    for form. At 0.07 it touches the bottom two stops and nothing else.
+ *
+ *    It also has to keep *slope* at the bottom, and this is the part the last
+ *    round got wrong. x * smoothstep( x / knee ) is cubic in x near the origin
+ *    if the smoothstep is used alone, so two shadow values a stop apart down at
+ *    display-linear 0.005 arrive three stops apart and then round to the same
+ *    code value: a shadow with no steps in it, which is what read as ink rather
+ *    than as shade. Blending the smoothstep against unity — rather than
+ *    replacing unity with it — leaves the curve with a floor slope of exactly
+ *    ( 1 - toe ) all the way to zero, and toe is therefore a statement about
+ *    how much separation the bottom of the frame is allowed to keep. It is not
+ *    allowed to be 1.
  *  - a shoulder: a hyperbolic roll above uShoulder. It leaves the curve with
  *    unit slope exactly at the knee — so there is no visible break where it
  *    engages — and asymptotes to 1.0, so an arbitrarily bright highlight
@@ -1598,8 +1609,13 @@ vec3 toneShape( vec3 c, float contrast, float toe, float toeKnee, float shoulder
 
   x = pow( max( x / 0.18, vec3( 1e-5 ) ), vec3( contrast ) ) * 0.18;
 
+  // Floor slope ( 1 - toe ), rising to unity at the knee. The linear term mixed
+  // into the smoothstep is what keeps the last stop and a half from collapsing:
+  // without it the density the toe adds is still growing as x -> 0, and a frame
+  // graded through it has separation at sRGB 0.10 and none at all at 0.02.
   vec3 t = sat3( x / max( 1e-4, toeKnee ) );
-  x *= mix( vec3( 1.0 ), t * t * ( 3.0 - 2.0 * t ), toe );
+  vec3 toeCurve = mix( t * t * ( 3.0 - 2.0 * t ), t, 0.30 );
+  x *= mix( vec3( 1.0 ), toeCurve, toe );
 
   float s = clamp( shoulder, 0.05, 0.95 );
   // The shoulder is normalised so that a chosen white point maps to exactly
@@ -1734,12 +1750,26 @@ vec3 fxaaFilter( sampler2D tex, vec2 uv, vec2 texel ) {
   float lMin = min( lM, min( min( lNW, lNE ), min( lSW, lSE ) ) );
   float lMax = max( lM, max( max( lNW, lNE ), max( lSW, lSE ) ) );
   // Contrast gate: flat regions are left alone so texture detail survives.
-  if ( lMax - lMin < max( 0.0312, lMax * 0.125 ) ) return rgbM;
+  //
+  // FXAA's *default* preset — an absolute floor of 1/32 and a relative gate of
+  // 1/8 of the local maximum — is the wrong preset for a frame whose worst
+  // aliasing is a parapet or a power cable against a sky sitting near the top of
+  // the range. At lMax around 0.9 the relative gate asks for a step of 0.113 in
+  // perceptual luma before the filter will touch the pixel, so a cable that only
+  // partly covers its pixel — which is every cable in this frame past twenty
+  // metres — presents a smaller step than that and ships raw. These are the
+  // published "extreme quality" numbers, 1/64 and 1/24: the gate against a bright
+  // sky drops to 0.037, which a half-covered dark wire clears comfortably.
+  if ( lMax - lMin < max( 0.0156, lMax * 0.0417 ) ) return rgbM;
 
   vec2 dir = vec2( -( ( lNW + lNE ) - ( lSW + lSE ) ), ( lNW + lSW ) - ( lNE + lSE ) );
   float reduce = max( ( lNW + lNE + lSW + lSE ) * 0.03125, 0.0078125 );
   float rcpMin = 1.0 / ( min( abs( dir.x ), abs( dir.y ) ) + reduce );
-  dir = clamp( dir * rcpMin, -8.0, 8.0 ) * texel;
+  // Span 12 rather than 8. The edges that stair-step worst here are the long
+  // near-horizontal ones — a catenary across the street, a roofline, a parapet
+  // cap — and the length of the blend along the edge is what sets how long a
+  // staircase tread the filter can flatten.
+  dir = clamp( dir * rcpMin, -12.0, 12.0 ) * texel;
 
   vec3 rgbA = 0.5 * (
     texture2D( tex, uv + dir * ( 1.0 / 3.0 - 0.5 ) ).rgb +
@@ -1809,13 +1839,23 @@ void main() {
   // whole tile's variance — the information is present in the buffer and the
   // display curve is simply not giving it any slope. This gives it some back.
   //
-  // Two constraints make it safe. The gain rolls off hyperbolically with the size
-  // of the deviation, so a facade against the sky cannot ring — a large step gets
-  // almost none of it while a subtle one gets all of it. And it is asymmetric:
-  // the dark side of a deviation gets the full gain and the light side rather
-  // less, because the failure being fixed is content sitting too high on the
-  // curve, and adding halo to the bright side of it would only put more of the
-  // frame above the clipping threshold.
+  // Three constraints make it safe. The gain rolls off hyperbolically with the
+  // size of the deviation, so a facade against the sky cannot ring — a large step
+  // gets almost none of it while a subtle one gets all of it. It is mildly
+  // asymmetric, favouring the dark side, because the failure being fixed is
+  // content sitting too high on the curve.
+  //
+  // And — this is the one that was missing, and it cost the last round the round
+  // — the darkening is limited as a *fraction of the pixel's own value* rather
+  // than as an absolute offset. uClarityLimit is 0.045 in display-linear, which
+  // is sRGB 0.24: an absolute subtraction of that size takes any shadow under a
+  // quarter of the scale straight to zero, and since a wide-radius high-pass
+  // fires hardest exactly at silhouettes, what it drew was a pure-black outline
+  // around every crate, every rock and every scrap of paper in the frame —
+  // measured, three percent of all pixels at absolute zero against the champion's
+  // half a percent. Ratio-limited, the same filter still puts a dark line there,
+  // it just puts it two stops down from the surface rather than at black, so the
+  // shadow keeps its steps and its penumbra.
   if ( uClarity > 0.0 ) {
     // At output texel spacing, not the internal buffer's: the preset the review
     // is captured at renders below the canvas resolution, and a radius specified
@@ -1833,8 +1873,14 @@ void main() {
     ) * 0.125;
     vec3 hi = color - lo;
     vec3 gain = vec3( uClarity ) / ( 1.0 + abs( hi ) * ( uClarity / max( uClarityLimit, 1e-4 ) ) );
-    gain *= mix( vec3( 1.0 ), vec3( 0.6 ), step( vec3( 0.0 ), hi ) );
-    color = clamp( color + hi * gain, 0.0, 1.0 );
+    gain *= mix( vec3( 1.0 ), vec3( 0.85 ), step( vec3( 0.0 ), hi ) );
+    vec3 delta = hi * gain;
+    // Never take more than this fraction of a pixel away. Multiplicative, so the
+    // filter's effect on a mid-grey is unchanged — 42% of 0.5 is ten times the
+    // limit — and only the deep shadows, where an absolute offset was clipping,
+    // are held back.
+    delta = max( delta, -color * 0.42 );
+    color = clamp( color + delta, 0.0, 1.0 );
   }
 
   float vig = 1.0 - uVignette * smoothstep( 0.12, 0.78, r2 );
@@ -1842,21 +1888,33 @@ void main() {
 
   color = linearToSrgb( color );
 
-  // Film black, and it goes *here* — after the display encode, because a print
-  // black is specified as a code value, not as a radiance. sRGB code 3 on a
-  // 0..255 scale, tinted very slightly cool, which is what the base density of
-  // a projection print actually measures. Applied as a range compression rather
-  // than an add, so the top of the scale is untouched and the frame keeps its
-  // white. The whole visible effect is that the darkest pixels stop being
-  // absolute zero; it is 2% of what the old linear lift was doing.
-  color = color * ( 1.0 - uFilmBlack ) + uFilmBlack * uFilmBlackTint;
-
   // Grain scales with darkness: film has more visible grain in the toe.
   float lum = lumaOf( color );
   float g = hash12( gl_FragCoord.xy + fract( uTime ) * 431.7 ) - 0.5;
-  color += g * uGrain * ( 0.35 + 0.9 * ( 1.0 - lum ) );
+  color = max( vec3( 0.0 ), color + g * uGrain * ( 0.35 + 0.9 * ( 1.0 - lum ) ) );
 
-  // Ordered dither to kill 8-bit banding in the sky gradient.
+  // Film black, and it goes *here* — after the display encode, because a print
+  // black is specified as a code value, not as a radiance; and after the grain,
+  // which is the ordering that was wrong.
+  //
+  // The grain's amplitude in the toe is 0.016 of the scale, and the floor it was
+  // being applied on top of was 0.012: so on every pixel sitting at the film
+  // black — which after a hard toe is most of every shadow in the frame — the
+  // grain had a better than even chance of taking it below zero, and half of the
+  // frame's black floor was landing at absolute zero. That is where the
+  // champion's 0.5% of pure-black pixels came from, and it is what the last
+  // round's clarity halo then multiplied into 3%. Compressed after the grain the
+  // floor is unconditional: nothing in the frame can reach code zero, and the
+  // darkest pixels carry the noise as modulation on top of a real base density.
+  //
+  // sRGB code ~4 on a 0..255 scale, tinted very slightly cool, which is what the
+  // base density of a projection print actually measures. Applied as a range
+  // compression rather than an add, so the top of the scale is untouched and the
+  // frame keeps its white.
+  color = color * ( 1.0 - uFilmBlack ) + uFilmBlack * uFilmBlackTint;
+
+  // Ordered dither to kill 8-bit banding in the sky gradient. Half a code value
+  // either way, which the film black above is sized to absorb.
   float dither = ( ignNoise( gl_FragCoord.xy ) - 0.5 ) / 255.0;
   gl_FragColor = vec4( clamp( color + dither, 0.0, 1.0 ), 1.0 );
 }
@@ -1938,7 +1996,8 @@ vec3 sunDiscRadiance( vec3 dir, vec3 sunDir ) {
 /**
  * One cloud layer projected onto a flat plane at the given altitude.
  *
- * Returns ( sunlight reaching this point, coverage alpha, thin-edge factor ).
+ * Returns ( sunlight reaching this point, coverage alpha, thin-edge factor,
+ * how much sunlit flank the ray presents ).
  *
  * A cloud is not an alpha mask with a gradient on it — it is a volume, and what
  * makes it read as one is that light entering the sun-facing side has to travel
@@ -1948,21 +2007,46 @@ vec3 sunDiscRadiance( vec3 dir, vec3 sunDir ) {
  * sunward shoulder on the *same* cloud, which is the whole difference between a
  * cloud and a wisp of grey paint.
  */
-vec4 cloudLayer( vec3 dir, float height, float scale, vec2 drift, float cover, float sharpness ) {
+vec4 cloudLayer( vec3 dir, float height, float scale, vec2 drift, float cover, float softness ) {
   if ( dir.y <= 0.007 ) return vec4( 0.0 );
   float t = height / dir.y;
   if ( t > 90000.0 ) return vec4( 0.0 );
 
   vec2 p = ( dir.xz * t ) * scale + drift * uTime;
 
-  float d = fbm5( p );
+  // Domain warp, and it is what stops the field posterising.
+  //
+  // vnoise interpolates a square lattice. Threshold it and the lattice survives
+  // the threshold: every cell boundary follows a grid diagonal and the sky fills
+  // with the scalloped rounded-square outlines the last round shipped. Warping
+  // the lookup by a low-frequency vector field before the fBm is evaluated
+  // destroys that alignment, and the same threshold then produces billowed lobes
+  // with the lumpy, self-similar outline a cumulus actually has.
+  vec2 warp = vec2(
+    fbm3( p * 0.53 + vec2( 1.7, 9.2 ) ),
+    fbm3( p * 0.53 + vec2( -5.1, 3.8 ) )
+  ) - 0.5;
+  vec2 pw = p + warp * 1.45;
+
+  float d = fbm5( pw );
   // A second, slower-moving warp keeps the layer from reading as a flat mask.
-  d = mix( d, fbm3( p * 0.47 + vec2( 11.3, -4.7 ) ), 0.35 );
+  d = mix( d, fbm3( pw * 0.47 + vec2( 11.3, -4.7 ) ), 0.35 );
 
-  float density = sat( ( d - cover ) * sharpness );
-  if ( density <= 0.001 ) return vec4( 0.0 );
+  // Soft coverage, not a threshold.
+  //
+  // sat( ( d - cover ) * 7.0 ) is a posterising operator: the field's own
+  // standard deviation is about 0.12, so a slope of 7 takes it from empty to
+  // fully opaque across barely a standard deviation and every cell arrives with
+  // a hard, aliased boundary and a flat interior. What the frame needs is a
+  // density *field* — a value that ramps across the whole width of the
+  // distribution so the mass has an interior with structure in it and an edge
+  // that fades. The width is wider on the low side than the high so the cells
+  // still close up into solid masses in their middles.
+  float density = smoothstep( cover - softness, cover + softness * 1.55, d );
+  if ( density <= 0.0015 ) return vec4( 0.0 );
 
-  // Vertical development, as a third octave at three times the frequency.
+  // Vertical development, as two further octaves at three and seven times the
+  // frequency.
   //
   // A cumulus is not a smooth blob with a gradient across it; it is a stack of
   // cells, and what tells you that is the way its sunward face breaks into
@@ -1972,33 +2056,39 @@ vec4 cloudLayer( vec3 dir, float height, float scale, vec2 drift, float cover, f
   // clearly visible. This modulates both the density and the light reaching
   // the point, so a tower is thicker *and* brighter on the sun side than the
   // hollow next to it.
-  float tower = fbm3( p * 3.1 + vec2( -6.2, 2.4 ) );
-  density *= 0.80 + 0.40 * tower;
+  float tower = fbm3( pw * 3.1 + vec2( -6.2, 2.4 ) );
+  float grain = fbm3( pw * 6.9 + vec2( 2.9, -8.1 ) );
+  float relief = 0.64 * tower + 0.36 * grain;
+  density *= 0.70 + 0.60 * relief;
 
   // Three taps along the sun's projection into the layer's plane, weighted so
-  // the near ones dominate. fbm3 rather than fbm5 — self-shadowing needs the
-  // low frequencies of the field, not its detail, and this keeps the layer at
-  // roughly the cost of the single fbm5 tap it replaces.
+  // the near ones dominate, and read through the *same* soft coverage curve the
+  // density uses — a hard-thresholded shadow march under a soft body is what
+  // gave the last round its clip-art edges.
   vec2 sunStep = normalize( uSunDir.xz + vec2( 1e-4 ) ) * 0.19;
+  float lo = cover - softness;
+  float hi = cover + softness * 1.55;
   float od =
-    sat( ( fbm3( p + sunStep ) - cover ) * sharpness ) * 1.00 +
-    sat( ( fbm3( p + sunStep * 2.3 ) - cover ) * sharpness ) * 0.62 +
-    sat( ( fbm3( p + sunStep * 4.4 ) - cover ) * sharpness ) * 0.34;
+    smoothstep( lo, hi, fbm3( pw + sunStep ) ) * 1.00 +
+    smoothstep( lo, hi, fbm3( pw + sunStep * 2.3 ) ) * 0.62 +
+    smoothstep( lo, hi, fbm3( pw + sunStep * 4.4 ) ) * 0.34;
 
   // Beer's law through the accumulated depth, plus a self-occlusion term from
   // the point's own density so the middle of a thick cell is darker than its
   // shoulder even when nothing upwind of it is.
-  float lightThrough = exp( -( od * 1.5 + density * 0.9 ) ) * ( 0.82 + 0.36 * tower );
+  //
+  // The extinction is deliberately shallow. A cumulus is one of the most
+  // strongly multiple-scattering media there is — light that enters it comes out
+  // again rather than being absorbed — so its shaded side is not black, it is a
+  // couple of stops under its lit side. At the old 1.5/0.9 the transmission
+  // bottomed out near 0.02 and the caller had no choice but to paint an inkblot.
+  float lightThrough = exp( -( od * 0.82 + density * 0.52 ) ) * ( 0.78 + 0.44 * relief );
 
   // Which face of the cell the ray is looking at, keyed to the sun vector.
   //
   // The layer is a plane, so the sun march above can only describe transmission
   // *across* it — it has no idea that a camera at street level looking twenty
-  // degrees up is looking at the underside of a cumulus, and an underside lit by
-  // a 21-degree sun is in shadow. That omission is why the establishing shot had
-  // no dark mass anywhere in its sky: the visible band, three degrees to about
-  // forty, is exactly the band that should be presenting shaded bases, and every
-  // cell in it was being shaded as though seen from the side. Above the sun's own
+  // degrees up is looking at the underside of a cumulus. Above the sun's own
   // elevation the ray starts to see the sunlit top instead.
   //
   // The ramp is deliberately slow. A cumulus base sits a kilometre up and its own
@@ -2007,12 +2097,12 @@ vec4 cloudLayer( vec3 dir, float height, float scale, vec2 drift, float cover, f
   // comes with it. Returned rather than applied, because it does not belong on
   // the transmission — it belongs on how bright the cell's *brightest* face is
   // allowed to be, which is the caller's decision.
-  float faceUp = sat( ( dir.y - uSunDir.y * 0.92 ) * 1.1 );
+  float faceUp = sat( ( dir.y - uSunDir.y * 0.55 ) * 1.25 );
 
   // Thin edges: where the cell has only just crossed the coverage threshold,
   // light passes almost straight through. This is the term that becomes the
   // silver lining when the sun is behind that edge.
-  float thin = ( 1.0 - density ) * smoothstep( 0.0, 0.28, density );
+  float thin = ( 1.0 - density ) * smoothstep( 0.0, 0.30, density );
 
   // Cumulus reach the horizon. Fading them out eight degrees up left the one
   // band of sky a street-level camera actually frames — the establishing shot
@@ -2036,86 +2126,99 @@ void main() {
   // roll because the clouds have to be composited in the same space the roll
   // leaves the sky in. See the ratio blend below.
   vec3 horizonCol;
-  vec3 preRoll = skyDomePreRoll(
-    dir, uSunDir, uTurbidity, uRayleigh, uMieCoefficient, uMieG,
-    uSkyIntensity, uGroundColor, uSkyRollKnee, uSkyRollMax, horizonCol
+  vec3 sky = skyRoll(
+    skyDomePreRoll(
+      dir, uSunDir, uTurbidity, uRayleigh, uMieCoefficient, uMieG,
+      uSkyIntensity, uGroundColor, uSkyRollKnee, uSkyRollMax, horizonCol
+    ),
+    uSkyRollKnee, uSkyRollMax
   );
-  vec3 sky = skyRoll( preRoll, uSkyRollKnee, uSkyRollMax );
 
   if ( dir.y > 0.007 ) {
     float cosSun = dot( dir, uSunDir );
-    float sunAmt = sat( cosSun * 0.5 + 0.5 );
 
-    // Sharpness doubled, and it is the difference between cumulus and haze.
+    // Two layers, and the numbers are chosen for parallax rather than for
+    // coverage. Different altitude, different scale and different drift means the
+    // projected fields slide across one another at different rates as the camera
+    // turns, so a cell in the near layer passes in front of one in the far layer
+    // and the field acquires depth. Two layers at similar scales are just one
+    // layer with more noise in it.
     //
-    // At 3.4 against a coverage threshold of 0.5 the density field topped out
-    // around 0.44 — every cell in the sky was less than half opaque, so what the
-    // frame got was a wisp that shifted the sky by a few code values and could not
-    // possibly carry a shadow side. Measured on the hero pose the whole cloud
-    // field moved the sky's tile variance by 0.001. A fair-weather cumulus is
-    // optically thick in its middle and thin only at its edge, which is what a
-    // steep threshold gives: opaque cells with defined outlines, and the same
-    // steepness applied to the sun march below so their self-shadowing sharpens
-    // with them.
-    vec4 low = cloudLayer( dir, 1.0, 1.35, vec2( 0.0042, 0.0017 ), uCloudCover, 7.0 );
-    vec4 high = cloudLayer( dir, 2.6, 0.62, vec2( 0.0115, -0.0038 ), uCloudCover + 0.07, 4.2 );
+    // Softness is the width of the coverage ramp in density units, against a
+    // field whose standard deviation is around 0.12: the low layer resolves into
+    // masses with solid interiors, the high layer stays veil-like.
+    vec4 low = cloudLayer( dir, 1.00, 1.42, vec2( 0.0042, 0.0017 ), uCloudCover, 0.105 );
+    vec4 high = cloudLayer( dir, 2.35, 0.71, vec2( 0.0122, -0.0041 ), uCloudCover + 0.05, 0.150 );
 
-    // Shadowed cloud is not grey: its underside is lit by the sky above it and
-    // by the ground below, so it goes blue-grey with a warm floor. The sunward
-    // shoulder takes the sun's own colour, warm and well over unity so it can
-    // clip into the bloom the way a real cloud edge does at this hour.
-    //
-    // The sky-fill term is taken through the roll. Unrolled, horizonCol on the
-    // sun side of the dome runs above unity — it is the same Preetham aureole,
-    // sampled along the longest slant path there is — so a quarter of it made a
-    // cloud's *shadow* side twice as bright as the sky it hung in, and the whole
-    // cloud field collapsed into a value indistinguishable from the aureole. The
-    // fill a cloud base receives cannot exceed the dome the frame is drawing.
+    // The sky fill a cloud base receives, taken through the roll. Unrolled,
+    // horizonCol on the sun side of the dome runs above unity — it is the same
+    // Preetham aureole, sampled along the longest slant path there is — and a
+    // fraction of it then made a cloud's shadow side brighter than the sky it
+    // hung in. The fill a cloud base receives cannot exceed the dome the frame
+    // is drawing.
     vec3 skyFill = skyRoll( horizonCol, uSkyRollKnee, uSkyRollMax );
-    vec3 shadeLow = vec3( 0.20, 0.23, 0.31 ) * uSkyIntensity + skyFill * 0.25;
-    vec3 shadeHigh = vec3( 0.34, 0.37, 0.45 ) * uSkyIntensity + skyFill * 0.18;
-    vec3 litLow = mix( shadeLow, vec3( 1.55, 1.36, 1.10 ) * uSkyIntensity, low.x );
-    vec3 litHigh = mix( shadeHigh, vec3( 1.32, 1.22, 1.08 ) * uSkyIntensity, high.x );
+
+    // The body the cloud is shaded from, and the whole of the value logic.
+    //
+    // A cloud is expressed as a *ratio* of the rolled sky next to it, because the
+    // roll is a display compression: an absolute radiance and the sky beside it
+    // both asymptote to the same ceiling near the sun, which is what flattened
+    // the sunward half of the dome into one value. But the ratio has to be the
+    // right way round, and last round it was not — a shadow side at 0.40 of the
+    // sky is a navy inkblot, not a cumulus. A cumulus is a diffuse white body
+    // with an albedo near 0.9 and it multiple-scatters ferociously: lit, it is
+    // roughly twice the luminance of the sky it hangs in; shaded, it is a little
+    // *under* the sky and tinted toward it, because the dome above and the ground
+    // below are what is lighting it. Nothing about it is ever dark blue.
+    //
+    // Neutralised toward the sky's own luminance, because a cloud takes its hue
+    // from the light on it and not from the Rayleigh scattering behind it, with a
+    // little of the sky's chroma left in and a little of the horizon fill mixed
+    // under it so the bases stay part of the same air.
+    vec3 body = mix( sky, vec3( lumaOf( sky ) ), 0.62 ) * 0.88 + skyFill * 0.11;
+
+    // Which face the ray presents, and it is a view-direction question the sun
+    // march inside the layer cannot answer.
+    //
+    // Looking away from the sun you see the fully lit side of a cell — the
+    // anti-solar half of the dome is where cumulus are at their brightest and
+    // whitest. Looking toward it you see the shaded base, with the sun behind the
+    // cell: dark body, blazing rim. The old code had this backwards, brightening
+    // the *sunward* clouds by 22% and dimming the anti-solar ones, which is why
+    // the establishing shot — which looks almost straight away from the sun, at
+    // the brightest cloud faces in the sky — came out with dark blobs in it.
+    float back = sat( -cosSun * 0.5 + 0.5 );
+    float presentLow = mix( 0.26, 1.0, pow( back, 0.8 ) );
+    float presentHigh = mix( 0.38, 1.0, pow( back, 0.8 ) );
+    // High in the dome the ray clears the cell's own base and sees its top,
+    // whichever way it is pointing.
+    presentLow = mix( presentLow, 1.0, low.w );
+    presentHigh = mix( presentHigh, 1.0, high.w );
+
+    // Transmission through the cell, raised to a root: multiple scattering makes
+    // the falloff from lit to shaded far gentler than Beer's law alone.
+    float litLowA = sat( pow( sat( low.x ), 0.55 ) * presentLow );
+    float litHighA = sat( pow( sat( high.x ), 0.55 ) * presentHigh );
+
+    // Shade goes toward the sky's colour — cool, and only a little darker than
+    // the air. Lit goes warm and well above it.
+    vec3 shadeTint = vec3( 0.92, 0.97, 1.10 );
+    vec3 litTint = vec3( 1.06, 1.01, 0.94 );
+    vec3 cLow = body * mix( 0.78 * shadeTint, 2.05 * litTint, litLowA );
+    vec3 cHigh = body * mix( 0.88 * shadeTint, 1.70 * litTint, litHighA );
 
     // Silver lining. Forward scatter through a thin edge, so it only appears
     // where the sun is actually behind that edge, and it falls off sharply with
-    // angle rather than glowing everywhere on the sunward half of the sky.
-    float forward = pow( sat( cosSun ), 7.0 );
+    // angle rather than glowing everywhere on the sunward half of the sky. It is
+    // the counterpart of back above: the half of the dome that presents shaded
+    // bases is the half that gets rims.
+    float forward = pow( sat( cosSun ), 6.0 );
     vec3 silver = vec3( 1.9, 1.62, 1.24 ) * uSkyIntensity * forward;
-    litLow += silver * low.z * 2.6;
-    litHigh += silver * high.z * 1.8;
+    cLow += silver * low.z * 2.4;
+    cHigh += silver * high.z * 1.6;
 
-    litLow *= mix( 0.88, 1.22, sunAmt );
-    litHigh *= mix( 0.92, 1.16, sunAmt );
-
-    // The cloud's radiance is absolute — a cumulus lit by this sun is the same
-    // brightness wherever in the sky it sits — and against an unrolled blue sky
-    // that is exactly right. But the roll is a *display* compression, and where
-    // it is working hard it flattens the cloud onto the sky along with
-    // everything else: at 33 degrees from the disc the aureole and a sunlit
-    // cloud top both asymptote to the roll maximum, which is why the sun side of
-    // the dome came out as one value with no cumulus in it at all. So where the
-    // sky has been rolled, the cloud is expressed instead as a *ratio* of the
-    // rolled sky beside it — a mass that is darker than the air on its shadow
-    // side and brighter on its lit side, which is what the physics said before
-    // the compression ate it. Below the knee the ratio form is never used.
-    float rolledAmt = sat( ( lumaOf( preRoll ) - uSkyRollKnee ) / max( 1e-4, uSkyRollKnee * 1.6 ) );
-    // Neutralised toward the sky's own luminance: a cloud takes its hue from the
-    // light on it, not from the Rayleigh scattering behind it.
-    vec3 body = mix( sky, vec3( lumaOf( sky ) ), 0.72 );
-    vec3 shadeMul = vec3( 0.83, 0.90, 1.14 );
-    vec3 litMul = vec3( 1.10, 1.02, 0.93 );
-
-    vec3 ratioLow = body * mix( 0.40 * shadeMul, mix( 0.68, 1.50, low.w ) * litMul, sat( low.x ) );
-    vec3 ratioHigh = body * mix( 0.56 * shadeMul, mix( 0.76, 1.30, high.w ) * litMul, sat( high.x ) );
-    ratioLow += silver * low.z * 1.9;
-    ratioHigh += silver * high.z * 1.3;
-
-    vec3 cLow = mix( litLow * 0.9, ratioLow, rolledAmt );
-    vec3 cHigh = mix( litHigh * 0.85, ratioHigh, rolledAmt );
-
-    float aHigh = high.y * 0.55;
-    float aLow = low.y * 0.94;
+    float aHigh = high.y * 0.58;
+    float aLow = low.y * 0.92;
 
     sky = mix( sky, cHigh, sat( aHigh ) );
     sky = mix( sky, cLow, sat( aLow ) );
