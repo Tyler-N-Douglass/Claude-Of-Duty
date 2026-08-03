@@ -53,8 +53,22 @@ async function boot(): Promise<void> {
     .add(new MenuSystem())
     .add(new RenderPipeline());
 
+  const boot = document.getElementById('boot');
+  const fill = document.getElementById('boot-fill');
+  const msg = document.getElementById('boot-msg');
+  engine.onProgress = (fraction, label) => {
+    if (fill) fill.style.width = `${Math.round(fraction * 100)}%`;
+    if (msg) msg.textContent = label === 'ready' ? 'ready' : `building ${label}`;
+  };
+
   await engine.init();
   engine.start();
+
+  // Hold the overlay until a frame has actually been presented, otherwise it
+  // fades to reveal an empty canvas and the black screen just moves later.
+  await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+  boot?.classList.add('done');
+  setTimeout(() => boot?.remove(), 600);
 
   // Expose for the automated visual-QA harness and for debugging.
   (window as unknown as { GAME: unknown; THREE: unknown }).GAME = {
@@ -66,8 +80,17 @@ async function boot(): Promise<void> {
 
 boot().catch((err) => {
   console.error(err);
-  const el = document.createElement('pre');
-  el.style.cssText = 'color:#f66;font:14px monospace;padding:24px;white-space:pre-wrap';
-  el.textContent = `Failed to start:\n${err?.stack ?? err}`;
-  document.getElementById('app')?.appendChild(el);
+  // Report into the boot overlay rather than behind it — appending to #app put
+  // the message underneath a full-screen element, so a startup failure showed
+  // the player a black screen with the explanation hidden under it.
+  const msg = document.getElementById('boot-msg');
+  const errEl = document.getElementById('boot-err');
+  if (msg) msg.textContent = 'failed to start';
+  if (errEl) errEl.textContent = String(err?.stack ?? err);
+  else {
+    const el = document.createElement('pre');
+    el.style.cssText = 'color:#e0736b;font:12px monospace;padding:24px;white-space:pre-wrap';
+    el.textContent = `Failed to start:\n${err?.stack ?? err}`;
+    document.body.appendChild(el);
+  }
 });

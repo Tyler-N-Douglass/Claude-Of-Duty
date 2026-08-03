@@ -127,6 +127,8 @@ export const MOVE = {
   walkableCos: Math.cos(46 * THREE.MathUtils.DEG2RAD),
   /** How fast the visual eye catches up after a step up/down, per second. */
   stepSmoothRate: 12,
+  /** Minimum seconds between step lifts; one tread at a sprint is ~0.12s. */
+  stepLiftCooldown: 0.09,
 
   slideSpeed: 8.5,
   slideDuration: 0.8,
@@ -259,6 +261,13 @@ export class MovementController {
   private mantleTimer = 0;
   private mantleDuration: number = MOVE.mantleTimeShort;
   private mantleProbeCooldown = 0;
+  /**
+   * Rate-limits tryStepLift. fixedUpdate runs at 120Hz and the capsule stays in
+   * contact with a step for many of those, so without this the lift re-fires
+   * every step and stepSmooth accumulates far faster than its 12/s decay sheds
+   * it. One lift per tread is the intent.
+   */
+  private stepLiftCooldown = 0;
   private readonly mantleStart = new THREE.Vector3();
   private readonly mantleTarget = new THREE.Vector3();
   private readonly mantleDir = new THREE.Vector3(0, 0, -1);
@@ -302,6 +311,7 @@ export class MovementController {
     this.slideTimer = 0;
     this.slideT = 0;
     this.mantleActive = false;
+    this.stepLiftCooldown = 0;
     this.mantleTimer = 0;
     this.mantleT = 0;
     this.proneLatched = false;
@@ -336,6 +346,7 @@ export class MovementController {
     if (this.jumpCooldownTimer > 0) this.jumpCooldownTimer -= dt;
     if (this.slideCooldownTimer > 0) this.slideCooldownTimer -= dt;
     if (this.mantleProbeCooldown > 0) this.mantleProbeCooldown -= dt;
+    if (this.stepLiftCooldown > 0) this.stepLiftCooldown -= dt;
     this.jumpBufferTimer = cmd.jumpPressed ? MOVE.jumpBuffer : Math.max(0, this.jumpBufferTimer - dt);
 
     if (this.mantleActive) {
@@ -896,6 +907,7 @@ export class MovementController {
    * into vertical speed, and the player visibly bounces up every stair.
    */
   private tryStepLift(phys: PhysicsWorld): void {
+    if (this.stepLiftCooldown > 0) return;
     const vx = this.blockedVX;
     const vz = this.blockedVZ;
     const speed = Math.hypot(vx, vz);
@@ -922,7 +934,14 @@ export class MovementController {
     _to.set(this.position.x, targetY, this.position.z);
     if (phys.overlapCapsule(_to, MOVE.radius, this.height, RayMask.Solid)) return;
 
-    this.stepSmooth += targetY - this.position.y;
+    // Clamp on the way in. The only other clamp lives in the ground-snap path,
+    // which is skipped for exactly the frames a lift is in flight — so relying
+    // on it let stepSmooth run away and swing the eye off the player.
+    const smoothLimit = MOVE.stepOffset + 0.08;
+    this.stepSmooth = THREE.MathUtils.clamp(
+      this.stepSmooth + (targetY - this.position.y), -smoothLimit, smoothLimit,
+    );
+    this.stepLiftCooldown = MOVE.stepLiftCooldown;
     this.position.y = targetY;
     // Hold the ground snap off the lower tread until the capsule has travelled
     // far enough forward to actually be over the new one.

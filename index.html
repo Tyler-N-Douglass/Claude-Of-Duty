@@ -6,13 +6,47 @@
     <title>Claude of Duty</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230b0d0e'/%3E%3Cpath d='M4 15h9v-3l5 4-5 4v-3H4zM19 8h9v16h-9z' fill='%23c8a44a'/%3E%3C/svg%3E" />
     <style>
-      html, body { margin: 0; padding: 0; overflow: hidden; background: #000; height: 100%; }
+      html, body { margin: 0; padding: 0; overflow: hidden; background: #0b0d0e; height: 100%; }
       #app { position: fixed; inset: 0; }
       canvas { display: block; width: 100%; height: 100%; }
+
+      /* The boot overlay is inlined here, not injected by the bundle, so it is
+         on screen before a single byte of JavaScript is parsed. Every texture in
+         this game is generated at runtime and the bakes are synchronous — at the
+         ultra preset that is 2048px maps across eighteen surface looks, which
+         blocks the main thread long enough that an unstyled page reads as a
+         crash. Anything is better than an unexplained black screen. */
+      #boot {
+        position: fixed; inset: 0; z-index: 40;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 18px; background: #0b0d0e;
+        font: 500 13px/1.4 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+        letter-spacing: .22em; text-transform: uppercase; color: #6f767d;
+        transition: opacity .45s ease; opacity: 1;
+      }
+      #boot.done { opacity: 0; pointer-events: none; }
+      #boot-title {
+        font-size: 30px; letter-spacing: .40em; font-weight: 300;
+        color: #e8e4dc; text-indent: .40em;
+      }
+      #boot-bar { width: 260px; height: 2px; background: #22262a; overflow: hidden; }
+      #boot-fill { height: 100%; width: 0%; background: #c8a44a; transition: width .3s ease; }
+      #boot-msg { color: #7d848b; font-size: 11px; min-height: 14px; }
+      #boot-err {
+        max-width: 780px; padding: 0 24px; color: #e0736b; text-transform: none;
+        letter-spacing: 0; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        white-space: pre-wrap; text-align: left;
+      }
     </style>
   </head>
   <body>
     <div id="app"></div>
+    <div id="boot">
+      <div id="boot-title">CLAUDE OF DUTY</div>
+      <div id="boot-bar"><div id="boot-fill"></div></div>
+      <div id="boot-msg">starting</div>
+      <div id="boot-err"></div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

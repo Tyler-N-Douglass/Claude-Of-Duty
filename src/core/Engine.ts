@@ -143,12 +143,26 @@ export class Engine {
     return this;
   }
 
+  /** Reports init progress so the boot overlay can show something moving. */
+  onProgress: ((fraction: number, label: string) => void) | null = null;
+
   async init(): Promise<void> {
     this.applyQuality();
     this.onResize();
-    for (const s of this.systems) {
-      if (s.init) await s.init(this.ctx);
+
+    const initable = this.systems.filter((s) => s.init);
+    for (let i = 0; i < initable.length; i++) {
+      const s = initable[i];
+      this.onProgress?.(i / initable.length, s.name);
+      // Yield to the browser before each system. The procedural bakes are
+      // synchronous and long — at the ultra preset the texture pass alone can
+      // hold the main thread for many seconds — so without handing control back
+      // the page cannot paint and the player watches a black screen with no
+      // indication the game is doing anything.
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      await s.init!(this.ctx);
     }
+    this.onProgress?.(1, 'ready');
     // Late-registered render systems (e.g. created during another init).
     for (const s of this.systems) {
       if (isRenderSystem(s)) this.renderSystem = s;
