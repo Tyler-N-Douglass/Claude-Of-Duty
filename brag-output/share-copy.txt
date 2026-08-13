@@ -1,0 +1,2 @@
+Claude of Duty. A Call of Duty that runs in a browser tab — 38,926 lines of TypeScript, zero image files, every texture generated at runtime.
+It graded its own frames blind against the real thing, and lost to itself twice before it won.
